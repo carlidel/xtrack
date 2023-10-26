@@ -479,20 +479,24 @@ class ModulatedHenonmap(BeamElement):
                     for k in range(0, n + 1):
                         if (k % 4) == 0:
                             fx_coeffs.append(curr_multipole_coeffs[n - 2] / factorial(k) / factorial(n - k))
-                            fx_x_exps.append(n - k)
-                            fx_y_exps.append(k)
+                            if i == 0:
+                                fx_x_exps.append(n - k)
+                                fx_y_exps.append(k)
                         elif (k % 4) == 2:
                             fx_coeffs.append(-1 * curr_multipole_coeffs[n - 2] / factorial(k) / factorial(n - k))
-                            fx_x_exps.append(n - k)
-                            fx_y_exps.append(k)
+                            if i == 0:
+                                fx_x_exps.append(n - k)
+                                fx_y_exps.append(k)
                         elif (k % 4) == 1:
                             fy_coeffs.append(-1 * curr_multipole_coeffs[n - 2] / factorial(k) / factorial(n - k))
-                            fy_x_exps.append(n - k)
-                            fy_y_exps.append(k)
+                            if i == 0:
+                                fy_x_exps.append(n - k)
+                                fy_y_exps.append(k)
                         else:
                             fy_coeffs.append(curr_multipole_coeffs[n - 2] / factorial(k) / factorial(n - k))
-                            fy_x_exps.append(n - k)
-                            fy_y_exps.append(k)
+                            if i == 0:
+                                fy_x_exps.append(n - k)
+                                fy_y_exps.append(k)
                 if i == 0:
                     kwargs.setdefault('n_fx_coeffs', len(fx_coeffs))
                     kwargs.setdefault('n_fy_coeffs', len(fy_coeffs))

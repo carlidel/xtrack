@@ -25,26 +25,6 @@ void ModulatedHenonmap_track_local_particle(ModulatedHenonmapData el, LocalParti
     double const ddx = ModulatedHenonmapData_get_ddx(el);
 
     int const norm = ModulatedHenonmapData_get_norm(el);
-
-    // double fx_coeffs[100000];
-    // int fx_x_exps[100000];
-    // int fx_y_exps[100000];
-    // for (int i = 0; i < n_fx_coeffs * n_turns; i++)
-    // {
-    //     fx_coeffs[i] = ModulatedHenonmapData_get_fx_coeffs(el, i);
-    //     fx_x_exps[i] = ModulatedHenonmapData_get_fx_x_exps(el, i);
-    //     fx_y_exps[i] = ModulatedHenonmapData_get_fx_y_exps(el, i);
-    // }
-
-    // double fy_coeffs[100000];
-    // int fy_x_exps[100000];
-    // int fy_y_exps[100000];
-    // for (int i = 0; i < n_fy_coeffs * n_turns; i++)
-    // {
-    //     fy_coeffs[i] = ModulatedHenonmapData_get_fy_coeffs(el, i);
-    //     fy_x_exps[i] = ModulatedHenonmapData_get_fy_x_exps(el, i);
-    //     fy_y_exps[i] = ModulatedHenonmapData_get_fy_y_exps(el, i);
-    // }
     
     
     //start_per_particle_block (part0->part)
@@ -143,8 +123,8 @@ void ModulatedHenonmap_track_local_particle(ModulatedHenonmapData el, LocalParti
         for (int i = 0; i < n_fx_coeffs; i++)
         {
             double prod = ModulatedHenonmapData_get_fx_coeffs(el, n_fx_coeffs * at_turn + i) * multipole_scale;
-            int x_power = ModulatedHenonmapData_get_fx_x_exps(el, n_fx_coeffs * at_turn + i);
-            int y_power = ModulatedHenonmapData_get_fx_y_exps(el, n_fx_coeffs * at_turn + i);
+            int x_power = ModulatedHenonmapData_get_fx_x_exps(el, i);
+            int y_power = ModulatedHenonmapData_get_fx_y_exps(el, i);
             for (int j = 0; j < x_power; j++)
             {
                 prod *= (sqrt_beta_x * x_hat);
@@ -159,8 +139,8 @@ void ModulatedHenonmap_track_local_particle(ModulatedHenonmapData el, LocalParti
         for (int i = 0; i < n_fy_coeffs; i++)
         {
             double prod = ModulatedHenonmapData_get_fy_coeffs(el, n_fy_coeffs * at_turn + i) * multipole_scale;
-            int x_power = ModulatedHenonmapData_get_fy_x_exps(el, n_fy_coeffs * at_turn + i);
-            int y_power = ModulatedHenonmapData_get_fy_y_exps(el, n_fy_coeffs * at_turn + i);
+            int x_power = ModulatedHenonmapData_get_fy_x_exps(el, i);
+            int y_power = ModulatedHenonmapData_get_fy_y_exps(el, i);
             for (int j = 0; j < x_power; j++)
             {
                 prod *= (sqrt_beta_x * x_hat);
