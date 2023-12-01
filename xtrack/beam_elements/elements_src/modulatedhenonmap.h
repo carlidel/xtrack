@@ -9,6 +9,7 @@
 /*gpufun*/
 void ModulatedHenonmap_track_local_particle(ModulatedHenonmapData el, LocalParticle* part0){
     int const n_turns = ModulatedHenonmapData_get_n_turns(el);
+    int const n_par_multipoles = ModulatedHenonmapData_get_n_par_multipoles(el);
 
     int const n_fx_coeffs = ModulatedHenonmapData_get_n_fx_coeffs(el);
     int const n_fy_coeffs = ModulatedHenonmapData_get_n_fy_coeffs(el);
@@ -35,6 +36,7 @@ void ModulatedHenonmap_track_local_particle(ModulatedHenonmapData el, LocalParti
         double py = LocalParticle_get_py(part);
         double delta = LocalParticle_get_delta(part);
         int at_turn = LocalParticle_get_at_turn(part);
+        int at_turn_multipole = LocalParticle_get_at_turn(part);
 
         if(at_turn >= n_turns)
         {
@@ -46,6 +48,18 @@ void ModulatedHenonmap_track_local_particle(ModulatedHenonmapData el, LocalParti
             {
                 at_turn += n_turns;
             }while(at_turn < 0);
+        }
+
+        if (at_turn_multipole >= n_par_multipoles)
+        {
+            at_turn_multipole = at_turn_multipole % n_par_multipoles;
+        }
+        if (at_turn_multipole < 0)
+        {
+            do
+            {
+                at_turn_multipole += n_par_multipoles;
+            } while (at_turn_multipole < 0);
         }
 
         #ifdef XSUITE_BACKTRACK
@@ -122,7 +136,7 @@ void ModulatedHenonmap_track_local_particle(ModulatedHenonmapData el, LocalParti
         double fx = 0;
         for (int i = 0; i < n_fx_coeffs; i++)
         {
-            double prod = ModulatedHenonmapData_get_fx_coeffs(el, n_fx_coeffs * at_turn + i) * multipole_scale;
+            double prod = ModulatedHenonmapData_get_fx_coeffs(el, n_fx_coeffs * at_turn_multipole + i) * multipole_scale;
             int x_power = ModulatedHenonmapData_get_fx_x_exps(el, i);
             int y_power = ModulatedHenonmapData_get_fx_y_exps(el, i);
             for (int j = 0; j < x_power; j++)
@@ -138,7 +152,7 @@ void ModulatedHenonmap_track_local_particle(ModulatedHenonmapData el, LocalParti
         double fy = 0;
         for (int i = 0; i < n_fy_coeffs; i++)
         {
-            double prod = ModulatedHenonmapData_get_fy_coeffs(el, n_fy_coeffs * at_turn + i) * multipole_scale;
+            double prod = ModulatedHenonmapData_get_fy_coeffs(el, n_fy_coeffs * at_turn_multipole + i) * multipole_scale;
             int x_power = ModulatedHenonmapData_get_fy_x_exps(el, i);
             int y_power = ModulatedHenonmapData_get_fy_y_exps(el, i);
             for (int j = 0; j < x_power; j++)

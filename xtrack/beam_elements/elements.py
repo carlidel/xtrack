@@ -3,17 +3,17 @@
 # Copyright (c) CERN, 2021.                 #
 # ######################################### #
 
-import numpy as np
 from numbers import Number
-from scipy.special import factorial
 
+import numpy as np
 import xobjects as xo
 import xpart as xp
+from scipy.special import factorial
 
 from ..base_element import BeamElement
-from ..random import RandomUniform, RandomExponential, RandomNormal
 from ..general import _pkg_root, _print
-from ..internal_record import RecordIndex, RecordIdentifier
+from ..internal_record import RecordIdentifier, RecordIndex
+from ..random import RandomExponential, RandomNormal, RandomUniform
 
 
 class ReferenceEnergyIncrease(BeamElement):
@@ -411,6 +411,7 @@ class ModulatedHenonmap(BeamElement):
         'sin_omega_y': xo.Float64[:],
         'cos_omega_y': xo.Float64[:],
         'n_turns': xo.Int64,
+        'n_par_multipoles': xo.Int64,
         'twiss_params': xo.Float64[:],
         'domegax': xo.Float64,
         'domegay': xo.Float64,
@@ -461,6 +462,7 @@ class ModulatedHenonmap(BeamElement):
             kwargs.setdefault('sin_omega_y', np.sin(omega_y))
             kwargs.setdefault('cos_omega_y', np.cos(omega_y))
             kwargs.setdefault('n_turns', len(omega_x))
+            kwargs.setdefault('n_par_multipoles', len(multipole_coeffs))
             kwargs.setdefault('twiss_params', twiss_params)
             kwargs.setdefault('domegax', 2*np.pi*dqx)
             kwargs.setdefault('domegay', 2*np.pi*dqy)
@@ -473,8 +475,7 @@ class ModulatedHenonmap(BeamElement):
             fy_coeffs = []
             fy_x_exps = []
             fy_y_exps = []
-            for i in range(len(omega_x)):
-                curr_multipole_coeffs = multipole_coeffs[i]
+            for i, curr_multipole_coeffs in enumerate(multipole_coeffs):
                 for n in range(2, len(curr_multipole_coeffs) + 2):
                     for k in range(0, n + 1):
                         if (k % 4) == 0:
