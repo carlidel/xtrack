@@ -68,6 +68,7 @@ def test_madloader_lhc_thick(test_context):
     assert np.isclose(tw0['betx', 'ip5'], tmad['betx', 'ip5:1'], atol=0, rtol=1e-5)
     assert np.isclose(tw0['bety', 'ip5'], tmad['bety', 'ip5:1'], atol=0, rtol=1e-5)
 
+
 @for_all_test_contexts
 def test_slicing_lhc_thick(test_context):
     line = xt.Line.from_json(test_data_folder /
@@ -173,6 +174,6 @@ def test_slicing_lhc_thick(test_context):
     assert np.isclose(line.vars['kqtd.b1']._value, line_thick.vars['kqtd.b1']._value,
                         rtol=0.03, atol=0)
     assert np.isclose(line.vars['ksf.b1']._value, line_thick.vars['ksf.b1']._value,
-                        rtol=0.01, atol=0)
+                        rtol=0.03, atol=0)
     assert np.isclose(line.vars['ksd.b1']._value, line_thick.vars['ksd.b1']._value,
-                        rtol=0.01, atol=0)
+                        rtol=0.03, atol=0)

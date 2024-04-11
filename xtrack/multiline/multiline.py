@@ -41,7 +41,7 @@ class Multiline:
             ll._name_in_multiline = nn
 
         self.metadata = {}
-            
+
     def to_dict(self, include_var_management=True):
 
         '''
@@ -80,7 +80,7 @@ class Multiline:
                     dct['_bb_config'][nn] = vv
 
         dct["metadata"] = deepcopy(self.metadata)
-            
+
         return dct
 
     @classmethod
@@ -121,7 +121,7 @@ class Multiline:
                     df = None
                 new_multiline._bb_config[
                     'dataframes'][nn] = df
-                
+
         if "metadata" in dct:
             new_multiline.metadata = dct["metadata"]
 
@@ -169,6 +169,46 @@ class Multiline:
                 dct = json.load(fid)
 
         return cls.from_dict(dct, **kwargs)
+
+    @classmethod
+    def from_madx(cls, file, stdout=None, **kwargs):
+        '''
+        Load a multiline from a MAD-X file.
+
+        Parameters
+        ----------
+        file: str
+            The MAD-X file to load from.
+        **kwargs: dict
+            Additional keyword arguments are passed to the `Line.from_madx_sequence`
+            method.
+
+        Returns
+        -------
+        new_multiline: Multiline
+            The multiline object.
+        '''
+        from cpymad.madx import Madx
+
+        mad = Madx(stdout=stdout)
+        mad.call(file)
+        lines = {}
+        for nn in mad.sequence.keys():
+            lines[nn] = xt.Line.from_madx_sequence(
+                mad.sequence[nn],
+                allow_thick=True,
+                deferred_expressions=True,
+                **kwargs)
+
+            lines[nn].particle_ref = xt.Particles(
+                mass0=mad.sequence[nn].beam.mass*1e9,
+                q0=mad.sequence[nn].beam.charge,
+                gamma0=mad.sequence[nn].beam.gamma)
+
+            if mad.sequence[nn].beam.bv == -1:
+                lines[nn].twiss_default['reverse'] = True
+
+        return cls(lines=lines)
 
     def copy(self):
         '''
@@ -230,6 +270,11 @@ class Multiline:
             A MultiTwiss object containing the twiss parameters for the lines.
         '''
 
+        for old, new in zip(['ele_start', 'ele_stop', 'ele_init', 'twiss_init'],
+                            ['start', 'end', 'init_at', 'init']):
+            if old in kwargs:
+                raise ValueError(f'`{old}` is deprecated. Please use `{new}`.')
+
         out = MultiTwiss()
         if lines is None:
             lines = self.line_names
@@ -277,6 +322,11 @@ class Multiline:
             Dictionary containing information about the matching result.
 
         '''
+
+        for old, new in zip(['ele_start', 'ele_stop', 'ele_init', 'twiss_init'],
+                            ['start', 'end', 'init_at', 'init']):
+            if old in kwargs:
+                raise ValueError(f'`{old}` is deprecated. Please use `{new}`.')
 
         line_names = kwargs.get('lines', self.line_names)
         kwargs, kwargs_per_twiss = _dispatch_twiss_kwargs(kwargs, line_names)
@@ -337,6 +387,10 @@ class Multiline:
 
     @property
     def varval(self):
+        return self.vars.val
+
+    @property
+    def vv(self): # alias for varval
         return self.vars.val
 
     @property
@@ -466,6 +520,17 @@ class Multiline:
 
         '''
 
+        # Check that the context in which the trackers are built is on CPU
+        for nn in ["clockwise", "anticlockwise"]:
+            if self._bb_config[f"{nn}_line"] is None:
+                continue
+            line = self.lines[self._bb_config[f"{nn}_line"]]
+            if not isinstance(line.tracker._context, xo.ContextCpu):
+                raise ValueError(
+                    "The trackers need to be built on CPU before "
+                    "configuring the beam-beam elements."
+                )
+
         if self._bb_config['dataframes']['clockwise'] is not None:
             bb_df_cw = self._bb_config['dataframes']['clockwise'].copy()
         else:
@@ -536,7 +601,8 @@ class MultiTwiss(dict):
 
 def _dispatch_twiss_kwargs(kwargs, lines):
     kwargs_per_twiss = {}
-    for arg_name in ['ele_start', 'ele_stop', 'twiss_init',
+    for arg_name in ['start', 'end', 'init_at', 'init',
+                        '_keep_initial_particles',
                         '_initial_particles', '_ebe_monitor']:
         if arg_name not in kwargs:
             continue

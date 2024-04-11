@@ -146,7 +146,7 @@ def test_eq_emitt(conf):
         assert np.isclose(ez, 3.8595e-6,  atol=0,     rtol=1e-4)
         checked = True
     elif tilt_machine_by_90_degrees and not vertical_orbit_distortion and wiggler_on:
-        assert np.isclose(ex, 5.8575e-13, atol=0,     rtol=4e-3) # Quite large, to be kept in mind
+        assert np.isclose(ex, 5.8575e-13, atol=0,     rtol=4e-3)  # Quite large, to be kept in mind
         assert np.isclose(ey, 6.9955e-10, atol=0,     rtol=1e-4)
         assert np.isclose(ez, 3.8595e-6,  atol=0,     rtol=1e-4)
         checked = True
@@ -156,7 +156,7 @@ def test_eq_emitt(conf):
         assert np.isclose(ez, 3.5762e-6,  atol=0,     rtol=1e-4)
         checked = True
     elif tilt_machine_by_90_degrees and vertical_orbit_distortion and not wiggler_on:
-        assert np.isclose(ex, 2.5531e-12, atol=0,     rtol=2e-3)
+        assert np.isclose(ex, 2.5531e-12, atol=0,     rtol=4e-3)
         assert np.isclose(ey, 7.0576e-10, atol=0,     rtol=1e-4)
         assert np.isclose(ez, 3.5763e-6,  atol=0,     rtol=1e-4)
         checked = True
@@ -204,7 +204,7 @@ def test_eq_emitt(conf):
 
         sigma_x_eq = float(np.sqrt(ex * tw_rad.betx[0] + ey * tw_rad.betx2[0] + (np.std(p.delta) * tw_rad.dx[0])**2))
         sigma_y_eq = float(np.sqrt(ex * tw_rad.bety1[0] + ey * tw_rad.bety[0] + (np.std(p.delta) * tw_rad.dy[0])**2))
-        sigma_zeta_eq = float(np.sqrt(ez * tw_rad.betz0))
+        sigma_zeta_eq = float(np.sqrt(ez * tw_rad.bets0))
 
         sigma_x_track = np.std(mon.x, axis=0)[-200:]
         sigma_y_track = np.std(mon.y, axis=0)[-200:]

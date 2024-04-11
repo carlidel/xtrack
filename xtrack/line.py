@@ -7,28 +7,37 @@ import io
 import math
 import logging
 import json
+import uuid
+import os
+from collections import defaultdict
+
 from contextlib import contextmanager
 from copy import deepcopy
 from pprint import pformat
-from typing import List, Literal, Optional
+from pathlib import Path
+from typing import List, Literal, Optional, Dict
 
 import numpy as np
+from scipy.constants import c as clight
 
 from . import linear_normal_form as lnf
 
 import xobjects as xo
-import xpart as xp
 import xtrack as xt
 import xdeps as xd
 from .compounds import CompoundContainer, CompoundType, Compound, SlicedCompound
-from .slicing import Slicer
+from .progress_indicator import progress
+from .slicing import Custom, Slicer, Strategy
+from .mad_writer import to_madx_sequence
 
-from .survey import survey_from_tracker
+from .survey import survey_from_line
 from xtrack.twiss import (compute_one_turn_matrix_finite_differences,
                           find_closed_orbit_line, twiss_line,
+                          compute_T_matrix_line,
+                          get_non_linear_chromaticity,
                           DEFAULT_MATRIX_STABILITY_TOL,
                           DEFAULT_MATRIX_RESPONSIVENESS_TOL)
-from .match import match_line, closed_orbit_correction, match_knob_line
+from .match import match_line, closed_orbit_correction, match_knob_line, Action
 from .tapering import compensate_radiation_energy_loss
 from .mad_loader import MadLoader
 from .beam_elements import element_classes
@@ -36,9 +45,12 @@ from . import beam_elements
 from .beam_elements import Drift, BeamElement, Marker, Multipole
 from .footprint import Footprint, _footprint_with_linear_rescale
 from .internal_record import (start_internal_logging_for_elements_of_type,
-                              stop_internal_logging_for_elements_of_type)
+                              stop_internal_logging_for_elements_of_type,
+                              stop_internal_logging)
 
 from .general import _print
+
+isref = xd.refs.is_ref
 
 log = logging.getLogger(__name__)
 
@@ -54,8 +66,8 @@ class Line:
     _element_dict = None
     config = None
 
-    def __init__(self, elements=(), element_names=None, particle_ref=None):
-
+    def __init__(self, elements=(), element_names=None, particle_ref=None,
+                 energy_program=None):
         """
         Parameters
         ----------
@@ -70,6 +82,8 @@ class Line:
             Reference particle providing rest mass, charge and reference enegy
             used for building particles distributions, computing twiss parameters
             and matching.
+        energy_program: EnergyProgram
+            (optional) Energy program used to update the reference energy during the tracking.
         """
 
         self.config = xt.tracker.TrackerConfig()
@@ -85,7 +99,6 @@ class Line:
         self._extra_config['reset_s_at_end_turn'] = True
         self._extra_config['matrix_responsiveness_tol'] = DEFAULT_MATRIX_RESPONSIVENESS_TOL
         self._extra_config['matrix_stability_tol'] = DEFAULT_MATRIX_STABILITY_TOL
-        self._extra_config['t0_time_dependent_vars'] = 0.
         self._extra_config['dt_update_time_dependent_vars'] = 0.
         self._extra_config['_t_last_update_time_dependent_vars'] = None
         self._extra_config['_radiation_model'] = None
@@ -127,10 +140,12 @@ class Line:
 
         self.particle_ref = particle_ref
 
-        self._var_management = None
-        self._line_vars = None
+        if energy_program is not None:
+            self.energy_program = energy_program # setter will take care of completing
+
+        self._init_var_management()
         self.tracker = None
-        
+
         self.metadata = {}
 
     @classmethod
@@ -166,19 +181,13 @@ class Line:
 
         if isinstance(dct['elements'], dict):
             elements = {}
-            num_elements = len(dct['elements'].keys())
-            for ii, (kk, ee) in enumerate(dct['elements'].items()):
-                if ii % 100 == 0:
-                    _print('Loading line from dict: '
-                        f'{round(ii/num_elements*100):2d}%  ',end="\r", flush=True)
+            for ii, (kk, ee) in enumerate(
+                    progress(dct['elements'].items(), desc='Loading line from dict')):
                 elements[kk] = _deserialize_element(ee, class_dict, _buffer)
         elif isinstance(dct['elements'], list):
             elements = []
-            num_elements = len(dct['elements'])
-            for ii, ee in enumerate(dct['elements']):
-                if ii % 100 == 0:
-                    _print('Loading line from dict: '
-                        f'{round(ii/num_elements*100):2d}%  ',end="\r", flush=True)
+            for ii, ee in enumerate(
+                    progress(dct['elements'], desc='Loading line from dict')):
                 elements.append(_deserialize_element(ee, class_dict, _buffer))
         else:
             raise ValueError('Field `elements` must be a dict or a list')
@@ -186,7 +195,7 @@ class Line:
         self = cls(elements=elements, element_names=dct['element_names'])
 
         if 'particle_ref' in dct.keys():
-            self.particle_ref = xp.Particles.from_dict(dct['particle_ref'],
+            self.particle_ref = xt.Particles.from_dict(dct['particle_ref'],
                                     _context=_buffer.context)
 
         if '_var_manager' in dct.keys():
@@ -204,6 +213,10 @@ class Line:
 
         if 'metadata' in dct.keys():
             self.metadata = dct['metadata']
+
+        if ('energy_program' in self.element_dict
+             and self.element_dict['energy_program'] is not None):
+            self.energy_program.line = self
 
         _print('Done loading line from dict.           ')
 
@@ -420,8 +433,9 @@ class Line:
         replace_in_expr=None,
         classes=(),
         ignored_madtypes=(),
-        allow_thick=False,
+        allow_thick=None,
         use_compound_elements=True,
+        name_prefix=None,
     ):
 
         """
@@ -493,6 +507,7 @@ class Line:
             replace_in_expr=replace_in_expr,
             allow_thick=allow_thick,
             use_compound_elements=use_compound_elements,
+            name_prefix=name_prefix
         )
         line = loader.make_line()
         return line
@@ -536,6 +551,69 @@ class Line:
 
         return out
 
+    def to_madx_sequence(self, sequence_name, mode='sequence'):
+        '''
+        Return a MAD-X sequence corresponding to the line.
+
+        Parameters
+        ----------
+        sequence_name : str
+            Name of the sequence.
+
+        Returns
+        -------
+        madx_sequence : str
+            MAD-X sequence.
+        '''
+        return to_madx_sequence(self, sequence_name, mode=mode)
+
+    def to_madng(self, sequence_name='seq', temp_fname=None, keep_files=False):
+
+        '''
+        Build a MAD NG instance from present state of the line.
+
+        Parameters
+        ----------
+        sequence_name : str
+            Name of the sequence.
+        temp_fname : str
+            Name of the temporary file to be used for the MAD NG instance.
+
+        Returns
+        -------
+        mng : MAD
+            MAD NG instance.
+        '''
+
+        try:
+            if temp_fname is None:
+                temp_fname = 'temp_madng_' + str(uuid.uuid4())
+
+            madx_seq = self.to_madx_sequence(sequence_name=sequence_name)
+            with open(f'{temp_fname}.madx', 'w') as fid:
+                fid.write(madx_seq)
+
+            from pymadng import MAD
+            mng = MAD()
+            mng.MADX.load(f'"{temp_fname}.madx"', f'"{temp_fname}"')
+            mng._init_madx_data = madx_seq
+
+            mng[sequence_name] = mng.MADX[sequence_name] # this ensures that the file has been read
+            mng[sequence_name].beam = mng.beam(particle="'custom'",
+                            mass=self.particle_ref.mass0 * 1e9,
+                            charge=self.particle_ref.q0,
+                            betgam=self.particle_ref.beta0[0] * self.particle_ref.gamma0[0])
+        finally:
+            if not keep_files:
+                for nn in [temp_fname + '.madx', temp_fname + '.mad']:
+                    if os.path.isfile(nn):
+                        os.remove(nn)
+
+        # mng[sequence_name].beam = mng.beam(particle="'proton'", energy=7000)
+
+
+        return mng
+
     def __getstate__(self):
         out = self.__dict__.copy()
         return out
@@ -563,6 +641,32 @@ class Line:
             with open(file, 'w') as fid:
                 json.dump(self.to_dict(**kwargs), fid, cls=xo.JEncoder)
 
+    def _to_table_dict(self):
+
+        elements = list(self.elements)
+        s_elements = np.array(list(self.get_s_elements()) + [self.get_length()])
+        element_types = list(map(lambda e: e.__class__.__name__, elements)) + [""]
+        isthick = np.array(list(map(_is_thick, elements)) + [False])
+        iscollective = np.array(list(map(xt.tracker._check_is_collective, elements)) + [False])
+        compound_name = list(self.get_element_compound_names()) + [None]
+        elements += [None]
+
+        for ii in range(len(compound_name)):
+            if compound_name[ii] is None:
+                compound_name[ii] = ''
+
+        out = {
+            's': s_elements,
+            'element_type': element_types,
+            'name': list(self.element_names) + ['_end_point'],
+            'isthick': isthick,
+            'iscollective': iscollective,
+            'compound_name': compound_name,
+            'element': elements
+        }
+
+        return out
+
     def to_pandas(self):
         '''
         Return a pandas DataFrame with the elements of the line.
@@ -572,30 +676,26 @@ class Line:
         line_df : pandas.DataFrame
             DataFrame with the elements of the line.
         '''
-
-        elements = self.elements
-        s_elements = np.array(self.get_s_elements())
-        element_types = list(map(lambda e: e.__class__.__name__, elements))
-        isthick = np.array(list(map(_is_thick, elements)))
-        compound_name = self.get_element_compound_names()
-
         import pandas as pd
 
-        elements_df = pd.DataFrame({
-            's': s_elements,
-            'element_type': element_types,
-            'name': self.element_names,
-            'isthick': isthick,
-            'compound_name': compound_name,
-            'element': elements
-        })
+        elements_df = pd.DataFrame(self._to_table_dict())
         return elements_df
 
-    def get_table(self):
-        df = self.to_pandas()
+    def get_table(self, attr=False):
 
-        data = {kk: df[kk].values for kk in df.columns}
+        data = self._to_table_dict()
         data.pop('element')
+
+        if attr:
+            for kk in self.attr.keys():
+                this_attr = self.attr[kk]
+                if hasattr(this_attr, 'get'):
+                    this_attr = this_attr.get() # bring to cpu
+                # Add zero at the end (there is _end_point)
+                data[kk] = np.concatenate((this_attr, [this_attr[-1]*0]))
+
+        for kk in data.keys():
+            data[kk] = np.array(data[kk])
 
         return xd.Table(data=data)
 
@@ -633,6 +733,9 @@ class Line:
 
         out.config.update(self.config.copy())
         out._extra_config.update(self._extra_config.copy())
+
+        if out.energy_program is not None:
+            out.energy_program.line = out
 
         return out
 
@@ -674,8 +777,10 @@ class Line:
 
         """
 
-        assert self.tracker is None, 'The line already has an associated tracker'
-        import xtrack as xt  # avoid circular import
+        if self.tracker is not None:
+            _print('The line already has an associated tracker')
+            return self.tracker
+
         self.tracker = xt.Tracker(
                                 line=self,
                                 _context=_context,
@@ -698,6 +803,17 @@ class Line:
             self.tracker._tracker_data_base.cache['attr'] = self._get_attr_cache()
 
         return self.tracker._tracker_data_base.cache['attr']
+
+    @property
+    def particle_ref(self):
+        return self._particle_ref
+
+    @particle_ref.setter
+    def particle_ref(self, particle_ref):
+        self._particle_ref = particle_ref
+        if self.particle_ref is not None and self.particle_ref.t_sim == 0:
+            self.particle_ref.t_sim = (
+                self.get_length() / self.particle_ref._xobject.beta0[0] / clight)
 
     def discard_tracker(self):
 
@@ -722,6 +838,7 @@ class Line:
         turn_by_turn_monitor=None,
         freeze_longitudinal=False,
         time=False,
+        with_progress=False,
         **kwargs):
 
         """
@@ -759,7 +876,11 @@ class Line:
         time: bool, optional
             If True, the time taken for tracking is recorded and can be retrieved
             in `line.time_last_track`.
-
+        with_progress: bool or int, optional
+            If truthy, a progress bar is displayed during tracking. If an integer
+            is provided, it is used as the number of turns between two updates
+            of the progress bar. If True, 100 is taken by default. By default,
+            equals to False and no progress bar is displayed.
         """
 
         self._check_valid_tracker()
@@ -772,6 +893,7 @@ class Line:
             turn_by_turn_monitor=turn_by_turn_monitor,
             freeze_longitudinal=freeze_longitudinal,
             time=time,
+            with_progress=with_progress,
             **kwargs)
 
     def slice_thick_elements(self, slicing_strategies):
@@ -781,7 +903,26 @@ class Line:
         Parameters
         ----------
         slicing_strategies : list
-            List of slicing Strategy objects.
+            List of slicing Strategy objects. In case multiple strategies
+            apply to the same element, the last one takes precedence)
+
+        Examples
+        --------
+
+        .. code-block:: python
+
+            line.slice_thick_elements(
+                slicing_strategies=[
+                    # Slicing with thin elements
+                    xt.Strategy(slicing=xt.Teapot(1)), # (1) Default applied to all elements
+                    xt.Strategy(slicing=xt.Uniform(2), element_type=xt.Bend), # (2) Selection by element type
+                    xt.Strategy(slicing=xt.Teapot(3), element_type=xt.Quadrupole),  # (4) Selection by element type
+                    xt.Strategy(slicing=xt.Teapot(4), name='mb1.*'), # (5) Selection by name pattern
+                    # Slicing with thick elements
+                    xt.Strategy(slicing=xt.Uniform(2, mode='thick'), name='mqf.*'), # (6) Selection by name pattern
+                    # Do not slice (leave untouched)
+                    xt.Strategy(slicing=None, name='mqd.1') # (7) Selection by name
+            ])
 
         """
 
@@ -803,7 +944,6 @@ class Line:
         W_matrix=None,
         method=None,
         scale_with_transverse_norm_emitt=None,
-        particles_class=None,
         _context=None, _buffer=None, _offset=None,
         _capacity=None,
         mode=None,
@@ -825,15 +965,15 @@ class Line:
             Number of particles to be generated (used if provided coordinates are
             all scalar).
         x : float or array
-            x coordinate of the particles (default is 0).
+            x coordinate of the particles in meters (default is 0).
         px : float or array
             px coordinate of the particles (default is 0).
         y : float or array
-            y coordinate of the particles (default is 0).
+            y coordinate of the particles in meters (default is 0).
         py : float or array
             py coordinate of the particles (default is 0).
         zeta : float or array
-            zeta coordinate of the particles (default is 0).
+            zeta coordinate of the particles in meters (default is 0).
         delta : float or array
             delta coordinate of the particles (default is 0).
         pzeta : float or array
@@ -867,7 +1007,7 @@ class Line:
             Location within the line at which particles are generated. It can be an
             index or an element name.
         match_at_s : float
-            `s` location within the line at which particles are generated. The value
+            `s` location in meters within the line at which particles are generated. The value
             needs to be in the drift downstream of the element at `at_element`.
             The matched particles are backtracked to the element at `at_element`
             from which the tracking automatically starts when the generated
@@ -908,8 +1048,8 @@ class Line:
             Particles object containing the generated particles.
 
         """
-
-        return xp.build_particles(
+        import xpart
+        return xpart.build_particles(
             line=self,
             particle_ref=particle_ref,
             num_particles=num_particles,
@@ -924,7 +1064,6 @@ class Line:
             W_matrix=W_matrix,
             method=method,
             scale_with_transverse_norm_emitt=scale_with_transverse_norm_emitt,
-            particles_class=particles_class,
             _context=_context, _buffer=_buffer, _offset=_offset,
             _capacity=_capacity,
             mode=mode,
@@ -935,7 +1074,7 @@ class Line:
         delta0=None, zeta0=None,
         r_sigma=None, nemitt_x=None, nemitt_y=None,
         delta_disp=None, delta_chrom=None, zeta_disp=None,
-        particle_co_guess=None, steps_r_matrix=None,
+        co_guess=None, steps_r_matrix=None,
         co_search_settings=None, at_elements=None, at_s=None,
         continue_on_closed_orbit_error=None,
         freeze_longitudinal=None,
@@ -943,7 +1082,8 @@ class Line:
         values_at_element_exit=None,
         radiation_method=None,
         eneloss_and_damping=None,
-        ele_start=None, ele_stop=None, twiss_init=None,
+        start=None, end=None, init=None,
+        num_turns=None,
         skip_global_quantities=None,
         matrix_responsiveness_tol=None,
         matrix_stability_tol=None,
@@ -953,23 +1093,43 @@ class Line:
         strengths=None,
         hide_thin_groups=None,
         group_compound_elements=None,
+        search_for_t_rev=None,
+        num_turns_search_t_rev=None,
         only_twiss_init=None,
         only_markers=None,
         only_orbit=None,
         compute_R_element_by_element=None,
         compute_lattice_functions=None,
         compute_chromatic_properties=None,
+        init_at=None,
+        x=None, px=None, y=None, py=None, zeta=None, delta=None,
+        betx=None, alfx=None, bety=None, alfy=None, bets=None,
+        dx=None, dpx=None, dy=None, dpy=None, dzeta=None,
+        mux=None, muy=None, muzeta=None,
+        ax_chrom=None, bx_chrom=None, ay_chrom=None, by_chrom=None,
+        ddx=None, ddpx=None, ddy=None, ddpy=None,
+        co_search_at=None,
         _continue_if_lost=None,
         _keep_tracking_data=None,
         _keep_initial_particles=None,
         _initial_particles=None,
         _ebe_monitor=None,
+        ele_start='__discontinued__',
+        ele_stop='__discontinued__',
+        ele_init='__discontinued__',
+        twiss_init='__discontinued__'
         ):
 
         if not self._has_valid_tracker():
             self.build_tracker()
 
         tw_kwargs = locals().copy()
+
+        for old, new in zip(['ele_start', 'ele_stop', 'ele_init', 'twiss_init'],
+                            ['start', 'end', 'init_at', 'init']):
+            if tw_kwargs[old] != '__discontinued__':
+                raise ValueError(f'`{old}` is deprecated. Please use `{new}`.')
+            tw_kwargs.pop(old)
 
         for kk, vv in self.twiss_default.items():
             if kk not in tw_kwargs.keys() or tw_kwargs[kk] is None:
@@ -980,10 +1140,21 @@ class Line:
 
     twiss.__doc__ = twiss_line.__doc__
 
-    def match(self, vary, targets, solve=True, restore_if_fail=True, solver=None,
-                  verbose=False, n_steps_max=20,
+    def twiss4d(self, **kwargs):
+
+        """
+        Compute the 4D Twiss parameters. Equivalent to `twiss` with `method='4d'`.
+        """
+
+        kwargs['method'] = '4d'
+        return self.twiss(**kwargs)
+
+    def match(self, vary, targets, solve=True, assert_within_tol=True,
                   compensate_radiation_energy_loss=False,
-                  **kwargs):
+                  solver_options={}, allow_twiss_failure=True,
+                  restore_if_fail=True, verbose=False,
+                  n_steps_max=20, default_tol=None,
+                  solver=None, **kwargs):
         '''
         Change a set of knobs in the beamline in order to match assigned targets.
 
@@ -995,24 +1166,41 @@ class Line:
             for the optimization.
         targets : list of Target objects
             List of targets to be matched.
-        restore_if_fail : bool
-            If True, the beamline is restored to its initial state if the matching
-            fails.
+        solve : bool
+            If True (default), the matching is performed immediately. If not an
+            Optimize object is returnd, which can be used for advanced matching.
+        assert_within_tol : bool
+            If True (default), an exception is raised if the matching fails.
         compensate_radiation_energy_loss : bool
             If True, the radiation energy loss is compensated at each step of the
             matching.
-        solver : str
-            Solver to be used for the matching. Available solvers are "fsolve"
-            and "bfgs".
+        solver_options : dict
+            Dictionary of options to be passed to the solver.
+        allow_twiss_failure : bool
+            If True (default), the matching continues if the twiss computation
+            computation fails at some of the steps.
+        restore_if_fail : bool
+            If True (default), the beamline is restored to its initial state if
+            the matching fails.
         verbose : bool
             If True, the matching steps are printed.
+        n_steps_max : int
+            Maximum number of steps for the matching before matching is stopped.
+        default_tol : float
+            Default tolerances used on the target. A dictionary can be provided
+            associating a tolerance to each target name. The tolerance provided
+            for `None` is used for all targets for which a tolerance is not
+            otherwise provided. Example: `default_tol={'betx': 1e-4, None: 1e-6}`.
+        solver : str
+            Solver to be used for the matching. Available solvers are `jacobian`
+            (default), and `fsolve`.
         **kwargs : dict
             Additional arguments to be passed to the twiss.
 
         Returns
         -------
-        result_info : dict
-            Dictionary containing information about the matching result.
+        optimizer : xdeps.Optimize
+            xdeps optimizer object used for the optimization.
 
         Examples
         --------
@@ -1034,16 +1222,15 @@ class Line:
                     xt.Target('dqy', 12.0, tol=0.05)]
             )
 
-
         .. code-block:: python
 
             # Match a local orbit bump
             tw_before = line.twiss()
 
             line.match(
-                ele_start='mq.33l8.b1',
-                ele_stop='mq.23l8.b1',
-                twiss_init=tw_before.get_twiss_init(at_element='mq.33l8.b1'),
+                start='mq.33l8.b1',
+                end='mq.23l8.b1',
+                init=tw_before.get_twiss_init(at_element='mq.33l8.b1'),
                 vary=[
                     xt.Vary(name='acbv30.l8b1', step=1e-10),
                     xt.Vary(name='acbv28.l8b1', step=1e-10),
@@ -1063,12 +1250,22 @@ class Line:
             )
 
         '''
-        return match_line(self, vary, targets, solve=solve,
-                          restore_if_fail=restore_if_fail,
-                          solver=solver, verbose=verbose,
-                          n_steps_max=n_steps_max,
-                          compensate_radiation_energy_loss=compensate_radiation_energy_loss,
-                          **kwargs)
+
+        for old, new in zip(['ele_start', 'ele_stop', 'ele_init', 'twiss_init'],
+                                ['start', 'end', 'init_at', 'init']):
+                if old in kwargs.keys():
+                    raise ValueError(f'`{old}` is deprecated. Please use `{new}`.')
+
+        return match_line(self,
+                        vary=vary, targets=targets, solve=solve,
+                        assert_within_tol=assert_within_tol,
+                        compensate_radiation_energy_loss=compensate_radiation_energy_loss,
+                        solver_options=solver_options,
+                        allow_twiss_failure=allow_twiss_failure,
+                        restore_if_fail=restore_if_fail,
+                        verbose=verbose, n_steps_max=n_steps_max,
+                        default_tol=default_tol, solver=solver, **kwargs)
+
 
     def match_knob(self, knob_name, vary, targets,
                    knob_value_start=0, knob_value_end=1,
@@ -1111,17 +1308,17 @@ class Line:
         Parameters
         ----------
         X0 : float
-            Initial X coordinate.
+            Initial X coordinate in meters.
         Y0 : float
-            Initial Y coordinate.
+            Initial Y coordinate in meters.
         Z0 : float
-            Initial Z coordinate.
+            Initial Z coordinate in meters.
         theta0 : float
-            Initial theta coordinate.
+            Initial theta coordinate in radians.
         phi0 : float
-            Initial phi coordinate.
+            Initial phi coordinate in radians.
         psi0 : float
-            Initial psi coordinate.
+            Initial psi coordinate in radians.
         element0 : int or str
             Element at which the given coordinates are defined.
 
@@ -1131,7 +1328,7 @@ class Line:
             Survey table.
         """
 
-        return survey_from_tracker(self.tracker, X0=X0, Y0=Y0, Z0=Z0, theta0=theta0,
+        return survey_from_line(self, X0=X0, Y0=Y0, Z0=Z0, theta0=theta0,
                                    phi0=phi0, psi0=psi0, element0=element0,
                                    reverse=reverse)
 
@@ -1201,21 +1398,25 @@ class Line:
                                 solver=solver, verbose=verbose,
                                 restore_if_fail=restore_if_fail)
 
-    def find_closed_orbit(self, particle_co_guess=None, particle_ref=None,
+    def find_closed_orbit(self, co_guess=None, particle_ref=None,
                           co_search_settings={}, delta_zeta=0,
                           delta0=None, zeta0=None,
                           continue_on_closed_orbit_error=False,
                           freeze_longitudinal=False,
-                          ele_start=None, ele_stop=None):
+                          start=None, end=None,
+                          num_turns=1,
+                          co_search_at=None,
+                          search_for_t_rev=False,
+                          num_turns_search_t_rev=None):
 
         """
         Find the closed orbit of the beamline.
 
         Parameters
         ----------
-        particle_co_guess : Particle
-            Particle used to compute the closed orbit. If None, the reference
-            particle is used.
+        co_guess : Particles or dict
+            Particle used as first guess to compute the closed orbit. If None,
+            the reference particle is used.
         particle_ref : Particle
             Particle used to compute the closed orbit. If None, the reference
             particle is used.
@@ -1227,19 +1428,24 @@ class Line:
         delta0 : float
             Initial delta coordinate.
         zeta0 : float
-            Initial zeta coordinate.
+            Initial zeta coordinate in meters.
         continue_on_closed_orbit_error : bool
             If True, the closed orbit at the last step is returned even if
             the closed orbit search fails.
         freeze_longitudinal : bool
             If True, the longitudinal coordinates are frozen during the closed
             orbit search.
-        ele_start : int or str
+        start : int or str
             Optional. It can be provided to find the periodic solution for
             a portion of the beamline.
-        ele_stop : int or str
+        end : int or str
             Optional. It can be provided to find the periodic solution for
             a portion of the beamline.
+        num_turns : int
+            Number of turns to be used for the closed orbit search.
+        co_search_at : int or str
+            Element at which the closed orbit search is performed. If None,
+            the closed orbit search is performed at the start of the line.
 
         Returns
         -------
@@ -1257,7 +1463,7 @@ class Line:
 
         self._check_valid_tracker()
 
-        if particle_ref is None and particle_co_guess is None:
+        if particle_ref is None and co_guess is None:
             particle_ref = self.particle_ref
 
         if self.iscollective:
@@ -1269,11 +1475,44 @@ class Line:
         else:
             line = self
 
-        return find_closed_orbit_line(line, particle_co_guess=particle_co_guess,
+        return find_closed_orbit_line(line, co_guess=co_guess,
                                  particle_ref=particle_ref, delta0=delta0, zeta0=zeta0,
                                  co_search_settings=co_search_settings, delta_zeta=delta_zeta,
                                  continue_on_closed_orbit_error=continue_on_closed_orbit_error,
-                                 ele_start=ele_start, ele_stop=ele_stop)
+                                 start=start, end=end, num_turns=num_turns,
+                                 co_search_at=co_search_at,
+                                 search_for_t_rev=search_for_t_rev,
+                                 num_turns_search_t_rev=num_turns_search_t_rev)
+
+    def compute_T_matrix(self, start=None, end=None,
+                         particle_on_co=None, steps_t_matrix=None):
+
+        """
+        Compute the second order tensor of the beamline.
+
+        Parameters
+        ----------
+        start : int or str
+            Element at which the computation starts.
+        end : int or str
+            Element at which the computation stops.
+        particle_on_co : Particle
+            Particle at the closed orbit (optional).
+        steps_r_matrix : int
+            Finite difference step for computing the second order tensor.
+
+        Returns
+        -------
+        T_matrix : ndarray
+            Second order tensor of the beamline.
+
+        """
+
+        self._check_valid_tracker()
+
+        return compute_T_matrix_line(self, start=start, end=end,
+                                particle_on_co=particle_on_co,
+                                steps_t_matrix=steps_t_matrix)
 
     def get_footprint(self, nemitt_x=None, nemitt_y=None, n_turns=256, n_fft=2**18,
             mode='polar', r_range=None, theta_range=None, n_r=None, n_theta=None,
@@ -1306,7 +1545,7 @@ class Line:
         r_range : tuple of floats
             Range of r values for footprint in polar mode. Default is (0.1, 6) sigmas.
         theta_range : tuple of floats
-            Range of theta values for footprint in polar mode. Default is
+            Range of theta values in radians for footprint in polar mode. Default is
             (0.05, pi / 2 - 0.05) radians.
         n_r : int
             Number of r values for footprint in polar mode. Default is 10.
@@ -1337,7 +1576,7 @@ class Line:
         delta0: float
             Initial value of the delta coordinate.
         zeta0: float
-            Initial value of the zeta coordinate.
+            Initial value of the zeta coordinate in meters.
 
         Returns
         -------
@@ -1367,10 +1606,88 @@ class Line:
 
         return fp
 
+    def get_amplitude_detuning_coefficients(self, nemitt_x=1e-6, nemitt_y=1e-6,
+                num_turns=256, a0_sigmas=0.01, a1_sigmas=0.1, a2_sigmas=0.2):
+
+        '''
+        Compute the amplitude detuning coefficients (det_xx = dQx / dJx,
+        det_yy = dQy / dJy, det_xy = dQx / dJy, det_yx = dQy / dJx) using
+        tracking.
+
+        Parameters
+        ----------
+        nemitt_x : float
+            Normalized emittance in the x-plane. Default is 1e-6.
+        nemitt_y : float
+            Normalized emittance in the y-plane. Default is 1e-6.
+        num_turns : int
+            Number of turns for tracking. Default is 256.
+        a0_sigmas : float
+            Amplitude of the first particle (in sigmas). Default is 0.01.
+        a1_sigmas : float
+            Amplitude of the second particle (in sigmas). Default is 0.1.
+        a2_sigmas : float
+            Amplitude of the third particle (in sigmas). Default is 0.2.
+
+        Returns
+        -------
+        det_xx : float
+            Amplitude detuning coefficient dQx / dJx.
+        det_yy : float
+            Amplitude detuning coefficient dQy / dJy.
+        det_xy : float
+            Amplitude detuning coefficient dQx / dJy.
+        det_yx : float
+            Amplitude detuning coefficient dQy / dJx.
+        '''
+
+        import nafflib as nl
+
+        gemitt_x = (nemitt_x / self.particle_ref._xobject.beta0[0]
+                            / self.particle_ref._xobject.gamma0[0])
+        gemitt_y = (nemitt_y / self.particle_ref._xobject.beta0[0]
+                            / self.particle_ref._xobject.gamma0[0])
+
+        Jx_1 = a1_sigmas**2 * gemitt_x / 2
+        Jx_2 = a2_sigmas**2 * gemitt_x / 2
+        Jy_1 = a1_sigmas**2 * gemitt_y / 2
+        Jy_2 = a2_sigmas**2 * gemitt_y / 2
+
+        particles = self.build_particles(
+                            method='4d',
+                            zeta=0, delta=0,
+                            x_norm=[a1_sigmas, a2_sigmas, a0_sigmas, a0_sigmas],
+                            y_norm=[a0_sigmas, a0_sigmas, a1_sigmas, a2_sigmas],
+                            nemitt_x=nemitt_x, nemitt_y=nemitt_y)
+
+        self.track(particles,
+                        num_turns=num_turns, time=True,
+                        turn_by_turn_monitor=True)
+        mon = self.record_last_track
+
+        arr2ctx = particles._context.nparray_from_context_array
+        assert np.all(arr2ctx(particles.state) > 0)
+
+        qx = np.zeros(4)
+        qy = np.zeros(4)
+
+        for ii in range(len(qx)):
+            qx[ii] = np.abs(nl.get_tune(mon.x[ii, :]))
+            qy[ii] = np.abs(nl.get_tune(mon.y[ii, :]))
+
+        det_xx = (qx[1] - qx[0]) / (Jx_2 - Jx_1)
+        det_yy = (qy[3] - qy[2]) / (Jy_2 - Jy_1)
+        det_xy = (qx[3] - qx[2]) / (Jy_2 - Jy_1)
+        det_yx = (qy[1] - qy[0]) / (Jx_2 - Jx_1)
+
+        return {'det_xx': det_xx, 'det_yy': det_yy,
+                'det_xy': det_xy, 'det_yx': det_yx}
+
     def compute_one_turn_matrix_finite_differences(
             self, particle_on_co,
             steps_r_matrix=None,
-            ele_start=None, ele_stop=None,
+            start=None, end=None,
+            num_turns=1,
             element_by_element=False, only_markers=False):
 
         '''Compute the one turn matrix using finite differences.
@@ -1382,10 +1699,10 @@ class Line:
         steps_r_matrix : float
             Step size for finite differences. In not given, default step sizes
             are used.
-        ele_start : str
+        start : str
             Optional. It can be used to find the periodic solution for a
             portion of the line.
-        ele_stop : str
+        end : str
             Optional. It can be used to find the periodic solution for a
             portion of the line.
 
@@ -1408,9 +1725,34 @@ class Line:
             line = self
 
         return compute_one_turn_matrix_finite_differences(line, particle_on_co,
-                        steps_r_matrix, ele_start=ele_start, ele_stop=ele_stop,
+                        steps_r_matrix, start=start, end=end,
+                        num_turns=num_turns,
                         element_by_element=element_by_element,
                         only_markers=only_markers)
+
+    def get_non_linear_chromaticity(self,
+                        delta0_range=(-1e-3, 1e-3), num_delta=5, fit_order=3, **kwargs):
+
+        '''Get non-linear chromaticity for given range of delta values
+
+        Parameters
+        ----------
+        delta0_range : tuple of float
+            Range of delta values for chromaticity computation.
+        num_delta : int
+            Number of delta values for chromaticity computation.
+        kwargs : dict
+            Additional arguments to be passed to the twiss.
+
+        Returns
+        -------
+        chromaticity : Table
+            Table containing the non-linear chromaticity information.
+
+        '''
+
+        return get_non_linear_chromaticity(self, delta0_range, num_delta,
+                                           fit_order, **kwargs)
 
     def get_length(self):
 
@@ -1483,7 +1825,83 @@ class Line:
         else:
             return s
 
-    def insert_element(self, name, element=None, index=None, at_s=None,
+    def _elements_intersecting_s(
+            self,
+            s: List[float],
+            tol=1e-16,
+    ) -> Dict[str, List[float]]:
+        """Given a list of s positions, return a list of elements 'cut' by s.
+
+        Arguments
+        ---------
+        s
+            A list of s positions.
+        tol
+            Tolerance used when checking if s falls inside an element, or
+            at its edge. Defaults to 1e-16.
+
+        Returns
+        -------
+        A dictionary, where the keys are the names of the intersected elements,
+        and the value for each key is a list of s positions (offset to be
+        relative to the start of the element) corresponding to the 'cuts'.
+        The structure is ordered such that the cuts are sequential.
+        """
+        cuts_for_element = defaultdict(list)
+
+        all_s_positions = self.get_s_elements()
+        all_s_iter = iter(zip(all_s_positions, self.element_names))
+        current_s_iter = iter(sorted(set(s)))
+
+        try:
+            start, name = next(all_s_iter)
+            current_s = next(current_s_iter)
+
+            while True:
+                element = self[name]
+                if not _is_thick(element):
+                    start, name = next(all_s_iter)
+                    continue
+
+                if np.isclose(current_s, start, atol=tol):
+                    current_s = next(current_s_iter)
+                    continue
+
+                end = start + element.length
+                if np.isclose(current_s, end, atol=tol):
+                    current_s = next(current_s_iter)
+                    continue
+
+                if start < current_s < end:
+                    cuts_for_element[name].append(current_s - start)
+                    current_s = next(current_s_iter)
+                    continue
+                if current_s < start:
+                    current_s = next(current_s_iter)
+                    continue
+                if end < current_s:
+                    start, name = next(all_s_iter)
+                    continue
+        except StopIteration:
+            # We have either exhausted `s` or the line
+            # Do we want to raise an error if `s` was not exhausted?
+            pass
+
+        return cuts_for_element
+
+    def cut_at_s(self, s: List[float]):
+        """Slice the line so that positions in s never fall inside an element."""
+        cuts_for_element = self._elements_intersecting_s(s)
+        strategies = [Strategy(None)]  # catch-all, ignore unaffected elements
+        for name, cuts in cuts_for_element.items():
+            scheme = Custom(at_s=cuts, mode='thick')
+            strategy = Strategy(scheme, name=name, exact=True)
+            strategies.append(strategy)
+
+        slicer = Slicer(self, slicing_strategies=strategies)
+        slicer.slice_in_place()
+
+    def insert_element(self, name, element=None, at=None, index=None, at_s=None,
                        s_tol=1e-6):
 
         """Insert an element in the line.
@@ -1492,18 +1910,22 @@ class Line:
         ----------
         name: str
             Name of the element.
-        index: int, optional
-            Index of the element in the line. If `index` is provided, `at_s`
-            must be None.
         element: xline.Element, optional
             Element to be inserted. If not given, the element of the given name
             already present in the line is used.
+        at: int, optional
+            Index of the element in the line. If `index` is provided, `at_s`
+            must be None.
         at_s: float, optional
-            Position of the element in the line. If `at_s` is provided, `index`
+            Position of the element in the line in meters. If `at_s` is provided, `index`
             must be None.
         s_tol: float, optional
-            Tolerance for the position of the element in the line.
+            Tolerance for the position of the element in the line in meters.
         """
+
+        if at is not None:
+            assert index is None
+            index = at
 
         if isinstance(index, str):
             assert index in self.element_names
@@ -1703,6 +2125,103 @@ class Line:
             for name in self.element_names
         ]
 
+    def transform_compound(
+            self,
+            compound_name,
+            x_shift=0,
+            y_shift=0,
+            x_rotation=0,
+            y_rotation=0,
+            s_rotation=0,
+    ):
+        """Transform a compound element.
+
+        Transformations are applied in the order: XYShift, XRotation, YRotation,
+        SRotation.
+
+        Parameters
+        ----------
+        compound_name : str
+            Name of the compound element to transform.
+        x_shift : float, optional
+            Shift in the x direction, in meters.
+        y_shift : float, optional
+            Shift in the y direction, in meters.
+        x_rotation : float, optional
+            Rotation around the x-axis, in degrees.
+        y_rotation : float, optional
+            Rotation around the y-axis, in degrees.
+        s_rotation : float, optional
+            Rotation around the s-axis, in degrees.
+        """
+        compound = self.get_compound_by_name(compound_name)
+        element_names = self.get_compound_subsequence(compound_name)
+        idx_begin = self.element_names.index(element_names[0])
+        idx_end = idx_begin + len(element_names)
+
+        # Elements and names to add in the order they will appear in the line
+        before, after = [], []
+        names_before, names_after = [], []
+
+        # Generate a unique name for the transformation
+        def _generate_name(transform_type):
+            base = f'{compound_name}_{transform_type}'
+            new_name = base
+            count = 1
+            while new_name in element_names:
+                new_name = f'{base}_{count}'
+                count += 1
+
+            return new_name
+
+        # Create the transformation elements
+        if x_shift or y_shift:
+            shift = xt.XYShift(dx=x_shift, dy=y_shift)
+            before += [shift]
+            names_before += [_generate_name('offset_entry')]
+            unshift = xt.XYShift(dx=-x_shift, dy=-y_shift)
+            after = [unshift] + after
+            names_after = [_generate_name('offset_exit')] + names_after
+
+        if x_rotation:
+            x_rot_elem = xt.XRotation(angle=x_rotation)
+            before += [x_rot_elem]
+            names_before += [_generate_name('xrot_entry')]
+            x_unrot_elem = xt.XRotation(angle=-x_rotation)
+            after = [x_unrot_elem] + after
+            names_after = [_generate_name('xrot_exit')] + names_after
+
+        if y_rotation:
+            y_rot_elem = xt.YRotation(angle=y_rotation)
+            before += [y_rot_elem]
+            names_before += [_generate_name('yrot_entry')]
+            y_unrot_elem = xt.YRotation(angle=-y_rotation)
+            after = [y_unrot_elem] + after
+            names_after = [_generate_name('yrot_exit')] + names_after
+
+        if s_rotation:
+            s_rot_elem = xt.SRotation(angle=s_rotation)
+            before += [s_rot_elem]
+            names_before += [_generate_name('tilt_entry')]
+            s_unrot_elem = xt.SRotation(angle=-s_rotation)
+            after = [s_unrot_elem] + after
+            names_after = [_generate_name('tilt_exit')] + names_after
+
+        # Commit the transformations to the line
+        self.compound_container.remove_compound(compound_name)
+
+        for idx, element in enumerate(reversed(after)):
+            new_name = names_after[-idx - 1]
+            self.insert_element(index=idx_end, element=element, name=new_name)
+            compound.add_transform(new_name, side='exit')
+
+        for idx, element in enumerate(reversed(before)):
+            new_name = names_before[-idx - 1]
+            self.insert_element(index=idx_begin, element=element, name=new_name)
+            compound.add_transform(new_name, side='entry')
+
+        self.compound_container.define_compound(compound_name, compound)
+
     def _enumerate_top_level(self):
         idx = 0
         while idx < len(self):
@@ -1842,9 +2361,13 @@ class Line:
             index_first_element = None
 
         if name_first_element is not None:
-            assert self.element_names.count(name_first_element) == 1, (
-                f"name_first_element={name_first_element} occurs more than once!"
-            )
+            n_occurrences = self.element_names.count(name_first_element)
+            if n_occurrences == 0:
+                raise ValueError(
+                    f"{name_first_element} not found in the line.")
+            if n_occurrences > 1:
+                raise ValueError(
+                    f"{name_first_element} occurs more than once in the line.")
             index_first_element = self.element_names.index(name_first_element)
 
         new_element_names = (list(self.element_names[index_first_element:])
@@ -1893,12 +2416,12 @@ class Line:
             assert self.iscollective is False, ('Cannot freeze energy '
                             'in collective mode (not yet implemented)')
         if state:
-            self.freeze_vars(xp.Particles.part_energy_varnames())
+            self.freeze_vars(xt.Particles.part_energy_varnames())
         else:
-            self.unfreeze_vars(xp.Particles.part_energy_varnames())
+            self.unfreeze_vars(xt.Particles.part_energy_varnames())
 
     def _energy_is_frozen(self):
-        for vn in xp.Particles.part_energy_varnames():
+        for vn in xt.Particles.part_energy_varnames():
             flag_name = f'FREEZE_VAR_{vn}'
             if flag_name not in self.config or self.config[flag_name] == False:
                 return False
@@ -1920,9 +2443,9 @@ class Line:
         assert self.iscollective is False, ('Cannot freeze longitudinal '
                         'variables in collective mode (not yet implemented)')
         if state:
-            self.freeze_vars(xp.Particles.part_energy_varnames() + ['zeta'])
+            self.freeze_vars(xt.Particles.part_energy_varnames() + ['zeta'])
         else:
-            self.unfreeze_vars(xp.Particles.part_energy_varnames() + ['zeta'])
+            self.unfreeze_vars(xt.Particles.part_energy_varnames() + ['zeta'])
 
     def freeze_vars(self, variable_names):
 
@@ -1958,7 +2481,7 @@ class Line:
             self.config[f'FREEZE_VAR_{name}'] = False
 
 
-    def configure_bend_model(self, core=None, edge=None):
+    def configure_bend_model(self, core=None, edge=None, num_multipole_kicks=None):
 
         """
         Configure the method used to track bends.
@@ -1973,18 +2496,23 @@ class Line:
             or 'suppressed'.
         """
 
-        if core not in [None, 'expanded', 'full']:
+        if core not in [None, 'adaptive', 'full', 'bend-kick-bend',
+                              'rot-kick-rot', 'expanded']:
             raise ValueError(f'Unknown bend model {core}')
 
         if edge not in [None, 'linear', 'full', 'suppressed']:
             raise ValueError(f'Unknown bend edge model {edge}')
 
         for ee in self.elements:
-            if core is not None and isinstance(ee, xt.Bend):
+            if core is not None and isinstance(ee,
+                                (xt.Bend, xt.CombinedFunctionMagnet)):
                 ee.model = core
 
             if edge is not None and isinstance(ee, xt.DipoleEdge):
                 ee.model = edge
+
+            if num_multipole_kicks is not None:
+                ee.num_multipole_kicks = num_multipole_kicks
 
     def configure_radiation(self, model=None, model_beamstrahlung=None,
                             model_bhabha=None, mode='deprecated'):
@@ -2039,6 +2567,8 @@ class Line:
             self._bhabha_model = None
 
         for kk, ee in self.element_dict.items():
+            if isinstance (ee, (xt.Quadrupole, xt.Bend)):
+                continue
             if hasattr(ee, 'radiation_flag'):
                 ee.radiation_flag = radiation_flag
 
@@ -2108,6 +2638,8 @@ class Line:
 
         if verbose: _print("Disable xdeps expressions")
         self._var_management = None # Disable expressions
+        if hasattr(self, '_in_multiline') and self._in_multiline is not None:
+            self._in_multiline._var_sharing = None
 
         buffer = self._buffer
         io_buffer = self.tracker.io_buffer
@@ -2174,6 +2706,22 @@ class Line:
         self._check_valid_tracker()
         return start_internal_logging_for_elements_of_type(self.tracker,
                                                     element_type, capacity)
+
+    def stop_internal_logging_for_all_elements(self, reinitialize_io_buffer=False):
+        """
+        Stop internal logging for all elements.
+
+        Parameters
+        ----------
+        reinitialize_io_buffer: bool
+            If True, the IO buffer is reinitialized (default: False).
+
+        """
+        self._check_valid_tracker()
+        stop_internal_logging(elements=self.elements)
+
+        if reinitialize_io_buffer:
+            self.tracker._init_io_buffer()
 
     def stop_internal_logging_for_elements_of_type(self, element_type):
 
@@ -2242,7 +2790,7 @@ class Line:
 
         '''
 
-        if self._var_management is not None:
+        if not _vars_unused(self):
             raise NotImplementedError('`remove_inactive_multipoles` not'
                                       ' available when deferred expressions are'
                                       ' used')
@@ -2292,7 +2840,7 @@ class Line:
 
         '''
 
-        if self._var_management is not None:
+        if not _vars_unused(self):
             raise NotImplementedError('`remove_zero_length_drifts` not'
                                       ' available when deferred expressions are'
                                       ' used')
@@ -2398,7 +2946,7 @@ class Line:
         # only separated by Drifts or Markers, this script removes the
         # middle apertures
         # TODO: this probably actually works, but better be safe than sorry
-        if self._var_management is not None:
+        if not _vars_unused(self):
             raise NotImplementedError('`remove_redundant_apertures` not'
                                       ' available when deferred expressions are'
                                       ' used')
@@ -2543,7 +3091,11 @@ class Line:
         elements_df = self.to_pandas()
 
         elements_df['is_aperture'] = elements_df.name.map(
-                                            lambda nn: _is_aperture(self.element_dict[nn]))
+                lambda nn: nn == '_end_point' or  _is_aperture(self.element_dict[nn]))
+
+        if not elements_df.name.values[-1] == '_end_point':
+            elements_df['is_aperture'][-1] = False
+
         elements_df['i_aperture_upstream'] = np.nan
         elements_df['s_aperture_upstream'] = np.nan
         elements_df['i_aperture_downstream'] = np.nan
@@ -2553,8 +3105,12 @@ class Line:
         # Elements that don't need aperture
         dont_need_aperture = {name: False for name in elements_df['name']}
         for name in elements_df['name']:
+            if name == '_end_point':
+                continue
             ee = self.element_dict[name]
             if _allow_backtrack(ee) and not name in needs_aperture:
+                dont_need_aperture[name] = True
+            if name.endswith('_entry') or name.endswith('_exit'):
                 dont_need_aperture[name] = True
 
             # Correct isthick for elements that need aperture but have zero length.
@@ -2571,13 +3127,7 @@ class Line:
         i_prev_aperture = elements_df[elements_df['is_aperture']].index[0]
         i_next_aperture = 0
 
-        for iee in range(i_prev_aperture, num_elements):
-
-            if iee % 100 == 0:
-                _print(
-                    f'Checking aperture: {round(iee/num_elements*100):2d}%  ',
-                    end="\r", flush=True)
-
+        for iee in progress(range(i_prev_aperture, num_elements), desc='Checking aperture'):
             if dont_need_aperture[elements_df.loc[iee, 'name']]:
                 continue
 
@@ -2649,7 +3199,7 @@ class Line:
             The modified line.
         '''
 
-        if self._var_management is not None:
+        if not _vars_unused(self):
             raise NotImplementedError('`merge_consecutive_multipoles` not'
                                       ' available when deferred expressions are'
                                       ' used')
@@ -2707,6 +3257,63 @@ class Line:
         else:
             return newline
 
+    def get_line_with_second_order_maps(self, split_at):
+
+        '''
+        Return a new lines with segments definded by the elements in `split_at`
+        replaced by second order maps.
+
+        Parameters
+        ----------
+        split_at : list of str
+            Names of elements at which to split the line.
+
+        Returns
+        -------
+        line_maps : Line
+            Line with segments replaced by second order maps.
+        '''
+
+        ele_cut_ext = split_at.copy()
+        if self.element_names[0] not in ele_cut_ext:
+            ele_cut_ext.insert(0, self.element_names[0])
+        if self.element_names[-1] not in ele_cut_ext:
+            ele_cut_ext.append(self.element_names[-1])
+
+        ele_cut_sorted = []
+        for ee in self.element_names:
+            if ee in ele_cut_ext:
+                ele_cut_sorted.append(ee)
+
+        elements_map_line = []
+        names_map_line = []
+        tw = self.twiss()
+
+        for ii in range(len(ele_cut_sorted)-1):
+            names_map_line.append(ele_cut_sorted[ii])
+            elements_map_line.append(self[ele_cut_sorted[ii]])
+
+            smap = xt.SecondOrderTaylorMap.from_line(
+                                    self, start=ele_cut_sorted[ii],
+                                    end=ele_cut_sorted[ii+1],
+                                    twiss_table=tw,
+                                    _buffer=self._buffer)
+            names_map_line.append(f'map_{ii}')
+            elements_map_line.append(smap)
+
+        names_map_line.append(ele_cut_sorted[-1])
+        elements_map_line.append(self[ele_cut_sorted[-1]])
+
+        line_maps = xt.Line(elements=elements_map_line, element_names=names_map_line)
+        line_maps.particle_ref = self.particle_ref.copy()
+
+        return line_maps
+
+    def target(self, tar, value, **kwargs):
+
+        action = ActionLine(line=self)
+        return xt.Target(action=action, tar=tar, value=value, **kwargs)
+
     def _freeze(self):
         self.element_names = tuple(self.element_names)
 
@@ -2755,6 +3362,16 @@ class Line:
             raise RuntimeError(
                 "This line does not have a valid tracker. "
                 "Please build the tracke using `line.build_tracker(...)`.")
+
+    @property
+    def name(self):
+        '''Name of the line (if it is part of a `MultiLine`)'''
+        if hasattr(self, '_in_multiline') and self._in_multiline is not None:
+            for kk, vv in self._in_multiline.lines.items():
+                if vv is self:
+                    return kk
+        else:
+            return None
 
     @property
     def iscollective(self):
@@ -2968,14 +3585,6 @@ class Line:
         self._extra_config['enable_time_dependent_vars'] = value
 
     @property
-    def t0_time_dependent_vars(self):
-        return self._extra_config['t0_time_dependent_vars']
-
-    @t0_time_dependent_vars.setter
-    def t0_time_dependent_vars(self, value):
-        self._extra_config['t0_time_dependent_vars'] = value
-
-    @property
     def dt_update_time_dependent_vars(self):
         return self._extra_config['dt_update_time_dependent_vars']
 
@@ -2999,6 +3608,28 @@ class Line:
     @property
     def twiss_default(self):
         return self._extra_config['twiss_default']
+
+    @property
+    def energy_program(self):
+        try:
+            out = self.element_dict['energy_program']
+        except KeyError:
+            out = None
+        return out
+
+    @energy_program.setter
+    def energy_program(self, value):
+        if value is None:
+            if 'energy_program' in self.element_dict:
+                del self.element_dict['energy_program']
+            return
+        self.element_dict['energy_program'] = value
+        assert self.vars is not None, (
+            'Xdeps expression need to be enabled to use `energy_program`')
+        if self.energy_program.needs_complete:
+            self.energy_program.complete_init(self)
+        self.energy_program.line = self
+        self.element_refs['energy_program'].t_turn_s_line = self.vars['t_turn_s']
 
     def __getitem__(self, ii):
         if isinstance(ii, str):
@@ -3037,14 +3668,154 @@ class Line:
             return out
 
     def _get_attr_cache(self):
-        cache = LineAttr(line=self,
-                         fields=['hxl', 'hyl', 'length', 'radiation_flag',
-                                 'delta_taper', 'voltage', 'frequency',
-                                 'lag', 'lag_taper',
-                                ('knl', 0), ('ksl', 0), ('knl', 1), ('ksl', 1),
-                                ('knl', 2), ('ksl', 2),
-                                ])
+        cache = LineAttr(
+            line=self,
+            fields=[
+                'hxl', 'hyl', 'length', 'radiation_flag', 'delta_taper', 'ks',
+                'voltage', 'frequency', 'lag', 'lag_taper',
+                'k0', 'k1', 'k1s', 'k2', 'h',
+                ('knl', 0), ('ksl', 0), ('knl', 1), ('ksl', 1),
+                ('knl', 2), ('ksl', 2), ('knl', 3), ('ksl', 3),
+            ],
+            derived_fields={
+                'k0l': lambda attr: attr['knl', 0] + attr['k0'] * attr['length'],
+                'k1l': lambda attr: attr['knl', 1] + attr['k1'] * attr['length'],
+                'k2l': lambda attr: attr['knl', 2] + attr['k2'] * attr['length'],
+                'k3l': lambda attr: attr['knl', 3],
+                'angle_x': lambda attr: attr['hxl'] + attr['h'] * attr['length'],
+                'k1sl': lambda attr: attr['ksl', 1] + attr['k1s'] * attr['length'],
+            }
+        )
         return cache
+
+    def _insert_thin_elements_at_s(self, elements_to_insert):
+
+        '''
+        Example:
+        elements_to_insert = [
+            # s .    # elements to insert (name, element)
+            (s0,     [(f'm0_at_a', xt.Marker()), (f'm1_at_a', xt.Marker()), (f'm2_at_a', xt.Marker())]),
+            (s0+10., [(f'm0_at_b', xt.Marker()), (f'm1_at_b', xt.Marker()), (f'm2_at_b', xt.Marker())]),
+            (s1,     [(f'm0_at_c', xt.Marker()), (f'm1_at_c', xt.Marker()), (f'm2_at_c', xt.Marker())]),
+        ]
+
+        '''
+
+        self._frozen_check()
+
+        s_cuts = [ee[0] for ee in elements_to_insert]
+        s_cuts = np.sort(s_cuts)
+
+        s_tol = 0.5e-6
+
+        tt_before_cut = self.get_table()
+
+        i_next = np.array([np.argmax(tt_before_cut['s'] > s_cut) for s_cut in s_cuts])
+        i_ele_containing = i_next - 1
+
+        needs_cut = np.abs(tt_before_cut['s'][i_ele_containing] - s_cuts) > s_tol
+
+        assert np.all(s_cuts[needs_cut] > tt_before_cut.s[i_ele_containing[needs_cut]])
+        assert np.all(s_cuts[needs_cut] < tt_before_cut.s[i_ele_containing[needs_cut]+1])
+        assert np.all(tt_before_cut.element_type[i_ele_containing[needs_cut]] == 'Drift')
+
+        i_drifts_to_cut = set(i_ele_containing[needs_cut])
+
+        for idr in progress(i_drifts_to_cut, desc='Cut drifts'):
+            name_drift = tt_before_cut.name[idr]
+            drift = self[name_drift]
+            assert isinstance(drift, xt.Drift)
+            _buffer = drift._buffer
+            l_drift = drift.length
+            s_start = tt_before_cut['s'][idr]
+            s_end = s_start + l_drift
+            s_cut_dr = np.sort([s_start] + list(s_cuts[i_ele_containing==idr]) + [s_end])
+
+            drifts_for_replacement = []
+            i_new_drifts = 0
+            new_drift_names = []
+            for ll in np.diff(s_cut_dr):
+                if ll > s_tol:
+                    drifts_for_replacement.append(xt.Drift(length=ll, _buffer=_buffer))
+                    new_drift_names.append(f'{name_drift}_{i_new_drifts}')
+                    assert new_drift_names[-1] not in self.element_names
+                    i_new_drifts += 1
+
+            insert_at = self.element_names.index(name_drift)
+            self.element_names.remove(name_drift)
+            cpd_name = self.compound_container.compound_name_for_element(name_drift)
+            if cpd_name is not None:
+                cpd = self.compound_container.compound_for_name(cpd_name)
+                assert name_drift in cpd.core
+                cpd.core.remove(name_drift)
+            else:
+                cpd = None
+            for nn, dd in zip(new_drift_names, drifts_for_replacement):
+                self.element_dict[nn] = dd
+                self.element_names.insert(insert_at, nn)
+                if cpd is not None:
+                    cpd.core.add(nn)
+                    self.compound_container._compound_name_for_element[nn] = cpd_name
+                insert_at += 1
+
+        tt_after_cut = self.get_table()
+
+        # Names for insertions
+        ele_name_insertions = []
+        for s_insert, ee in progress(elements_to_insert, desc="Locate insertion points"):
+            # Find element_name for insertion
+            ii_ins = np.where(tt_after_cut['s'] >= s_insert - s_tol)[0][0]
+            ele_name_insertions.append(tt_after_cut['name'][ii_ins])
+            assert np.abs(s_insert - tt_after_cut['s'][ii_ins]) < s_tol
+
+        # Add all elements to self.element_dict
+        for s_insert, ee in elements_to_insert:
+            for nn, el in ee:
+                assert nn not in self.element_dict
+                self.element_dict[nn] = el
+
+        # Insert elements
+        for i_ins, (s_insert, ee) in enumerate(
+                    progress(elements_to_insert, desc="Inserting elements")):
+            ele_name_ins = ele_name_insertions[i_ins]
+            cpd_name_ins = self.compound_container.compound_name_for_element(ele_name_ins)
+            if cpd_name_ins is not None:
+                cpd_ins = self.compound_container.compound_for_name(cpd_name_ins)
+            else:
+                cpd_ins = None
+
+            if ele_name_ins not in self.element_names:
+                assert ele_name_ins == '_end_point'
+                insert_at = None
+            else:
+                insert_at = self.element_names.index(ele_name_ins)
+            for nn, el in ee:
+
+                assert el.isthick == False
+                if insert_at is None:
+                    self.element_names.append(nn)
+                else:
+                    self.element_names.insert(insert_at, nn)
+
+                if cpd_ins is None:
+                    pass # No compound
+                elif ele_name_ins in cpd_ins.core:
+                    cpd_ins.core.add(nn)
+                    self.compound_container._compound_name_for_element[nn] = cpd_name_ins
+                elif ele_name_ins in cpd_ins.entry:
+                    pass # Goes in front ot the compound but does not belong to it
+                elif ele_name_ins in cpd_ins.exit:
+                    assert len(cpd.exit_transform) == 0
+                    cpd_ins.core.add(nn)
+                    self.compound_container._compound_name_for_element[nn] = cpd_name_ins
+                elif ele_name_ins in cpd_ins.exit_transform:
+                    cpd_ins.core.add(nn)
+                    self.compound_container._compound_name_for_element[nn] = cpd_name_ins
+                else:
+                    raise ValueError(f'Inconsistent insertion in compound {cpd_name_ins}')
+
+                if insert_at is not None:
+                    insert_at += 1
 
 def frac(x):
     return x % 1
@@ -3172,6 +3943,8 @@ def mk_class_namespace(extra_classes):
         all_classes = element_classes + extra_classes
         log.warning("Xfields not installed correctly")
 
+    all_classes = all_classes + (EnergyProgram,)
+
     out = AttrDict()
     for cl in all_classes:
         out[cl.__name__] = cl
@@ -3239,7 +4012,14 @@ def _apertures_equal(ap1, ap2):
 
 
 def _lines_equal(line1, line2):
-    return _dicts_equal(line1.to_dict(), line2.to_dict())
+    d1 = line1.to_dict()
+    d2 = line2.to_dict()
+    d1.pop('_var_management_data', None)
+    d2.pop('_var_management_data', None)
+    d1.pop('_var_manager', None)
+    d2.pop('_var_manager', None)
+    out = _dicts_equal(d1, d2)
+    return out
 
 
 DEG2RAD = np.pi / 180.
@@ -3409,7 +4189,7 @@ class LineVars:
         if self.line._xdeps_vref is None:
             raise RuntimeError(
                 f'Cannot access variables as the line has no xdeps manager')
-        name = np.array(list(self.keys()))
+        name = np.array([kk for kk in list(self.keys()) if kk != '__vary_default'])
         value = np.array([self.line._xdeps_vref[kk]._value for kk in name])
 
         return xd.Table({'name': name, 'value': value})
@@ -3456,7 +4236,7 @@ class LineVars:
 
     def __setitem__(self, key, value):
         if self.cache_active:
-            if xd.refs._isref(value) or isinstance(value, VarSetter):
+            if isref(value) or isinstance(value, VarSetter):
                 raise ValueError('Cannot set a variable to a ref when the '
                                  'cache is active')
             self._setter_from_cache(key)(value)
@@ -3473,25 +4253,47 @@ class LineVars:
         self._cache_active = value
         self.line._xdeps_manager._tree_frozen = value
 
-    def load_madx_optics_file(self, filename):
+    def set_from_madx_file(self, filename, mad_stdout=False):
+
+        '''
+        Set variables veluas of expression from a MAD-X file.
+
+        Parameters
+        ----------
+        filename : str or list of str
+            Path to the MAD-X file(s) to load.
+        mad_stdout : bool, optional
+            If True, the MAD-X output is printed to stdout.
+
+        Notes
+        -----
+        The MAD-X file is executed in a temporary MAD-X instance, and the
+        variables are copied to the line after the execution.
+        '''
+
         from cpymad.madx import Madx
-        mad = Madx()
+        mad = Madx(stdout=mad_stdout)
         mad.options.echo = False
         mad.options.info = False
         mad.options.warn = False
-        mad.call(str(filename))
+        if isinstance(filename, (str, Path)):
+            filename = [filename]
+        else:
+            assert isinstance(filename, (list, tuple))
+        for ff in filename:
+            mad.call(str(ff))
 
         assert self.cache_active is False, (
             'Cannot load optics file when cache is active')
 
         mad.input('''
-        elm: marker; seq: sequence, l=1; e:elm, at=0.5; endsequence;
-        beam; use,sequence=seq;''')
+        elm: marker; dummy: sequence, l=1; e:elm, at=0.5; endsequence;
+        beam; use,sequence=dummy;''')
 
         defined_vars = set(mad.globals.keys())
 
         xt.general._print.suppress = True
-        dummy_line = xt.Line.from_madx_sequence(mad.sequence.seq,
+        dummy_line = xt.Line.from_madx_sequence(mad.sequence.dummy,
                                                 deferred_expressions=True)
         xt.general._print.suppress = False
 
@@ -3499,11 +4301,44 @@ class LineVars:
             {kk: dummy_line._xdeps_vref._owner[kk] for kk in defined_vars})
         self.line._xdeps_manager.copy_expr_from(dummy_line._xdeps_manager, "vars")
 
-        for nn in self.line._xdeps_vref._owner.keys():
-            if (self.line._xdeps_vref[nn]._expr is None
-                and len(self.line._xdeps_vref[nn]._find_dependant_targets()) > 1 # always contain itself
-                ):
-                self.line._xdeps_vref[nn] = self.line._xdeps_vref._owner[nn]
+        try:
+            self.line._xdeps_vref._owner.default_factory = lambda: 0
+            allnames = list(self.line._xdeps_vref._owner.keys())
+            for nn in allnames:
+                if (self.line._xdeps_vref[nn]._expr is None
+                    and len(self.line._xdeps_vref[nn]._find_dependant_targets()) > 1 # always contain itself
+                    ):
+                    self.line._xdeps_vref[nn] = self.line._xdeps_vref._owner.get(nn, 0)
+        except Exception as ee:
+            self.line._xdeps_vref._owner.default_factory = None
+            raise ee
+
+        self.line._xdeps_vref._owner.default_factory = None
+
+    def load_madx_optics_file(self, filename, mad_stdout=False):
+        self.set_from_madx_file(filename, mad_stdout=mad_stdout)
+
+    def target(self, tar, value, **kwargs):
+        action = ActionVars(self.line)
+        return xt.Target(action=action, tar=tar, value=value, **kwargs)
+
+class ActionVars(Action):
+
+    def __init__(self, line):
+        self.line = line
+
+    def run(self, **kwargs):
+        assert not self.line.vars.cache_active, (
+            'Cannot run action when cache is active')
+        return self.line._xdeps_vref._owner
+
+class ActionLine(Action):
+
+    def __init__(self, line):
+        self.line = line
+
+    def run(self):
+        return self.line
 
 class VarValues:
 
@@ -3581,15 +4416,33 @@ class LineAttrItem:
 
     def get_full_array(self):
         full_array = np.zeros(len(self.mask), dtype=np.float64)
-        full_array[self.mask] = self.multisetter.get_values()
+        ctx2np = self.multisetter._context.nparray_from_context_array
+        full_array[self.mask] = ctx2np(self.multisetter.get_values())
         return full_array
 
 
 class LineAttr:
+    """A class to access a field of all elements in a line.
 
-    def __init__(self, line, fields):
+    The field can be a scalar or a vector. In the latter case, the index
+    can be specified to access a specific element of the vector.
+
+    Parameters
+    ----------
+    line : Line
+        The line to access.
+    fields : list of str or tuple of (str, int)
+        The fields to access. If a tuple is provided, the second element
+        is the index of the vector to access.
+    derived_fields : dict, optional
+        A dictionary of derived fields. The key is the name of the derived
+        field and the value is a function that takes the LineAttr object
+        as argument and returns the value of the derived field.
+    """
+    def __init__(self, line, fields, derived_fields=None):
         self.line = line
         self.fields = fields
+        self.derived_fields = derived_fields or {}
         self._cache = {}
 
         for ff in fields:
@@ -3601,4 +4454,164 @@ class LineAttr:
             self._cache[ff] = LineAttrItem(name=name, index=index, line=line)
 
     def __getitem__(self, key):
+        if key in self.derived_fields:
+            return self.derived_fields[key](self)
+
         return self._cache[key].get_full_array()
+
+    def keys(self):
+        return list(self.fields) + list(self.derived_fields.keys())
+
+
+class EnergyProgram:
+
+    def __init__(self, t_s, kinetic_energy0=None, p0c=None):
+
+        assert hasattr (t_s, '__len__'), 't_s must be a list or an array'
+
+        assert p0c is not None or kinetic_energy0 is not None, (
+            'Either p0c or kinetic_energy0 needs to be provided')
+
+        assert np.isclose(t_s[0], 0, rtol=0, atol=1e-12), 't_s must start from 0'
+
+        self.p0c = p0c
+        self.kinetic_energy0 = kinetic_energy0
+        self.t_s = t_s
+        self.needs_complete = True
+
+    def complete_init(self, line):
+
+        assert self.needs_complete, 'EnergyProgram already completed'
+
+        p0c = self.p0c
+        kinetic_energy0 = self.kinetic_energy0
+        t_s = self.t_s
+
+        enevars = {}
+        assert line is not None, 'line must be provided'
+        assert line.particle_ref is not None, (
+            'line must have a valid particle_ref')
+
+        mass0 = line.particle_ref.mass0
+        circumference = line.get_length()
+
+        if p0c is not None:
+            assert hasattr (p0c, '__len__'), 'p0c must be a list or an array'
+            assert len(t_s) == len(p0c), 't_s and p0c must have same length'
+            enevars['p0c'] = p0c
+
+        if kinetic_energy0 is not None:
+            assert hasattr (kinetic_energy0, '__len__'), (
+                'kinetic_energy0 must be a list or an array')
+            assert len(t_s) == len(kinetic_energy0), (
+                't_s and kinetic_energy0 must have same length')
+
+            energy0 = kinetic_energy0 + mass0
+            enevars['energy0'] = energy0
+
+        # I use a particle to make the conversions
+        p = xt.Particles(**enevars, mass0=mass0)
+        beta0_program = p.beta0
+        bet0_mid = 0.5*(beta0_program[1:] + beta0_program[:-1])
+
+        dt_s = np.diff(t_s)
+
+        i_turn_at_t_samples = np.zeros_like(t_s)
+        i_turn_at_t_samples[1:] = (
+            beta0_program[0] * clight / circumference * t_s[0] +
+            np.cumsum(bet0_mid * clight / circumference * dt_s))
+        # In this way i_turn = 0 corresponds to t_s[0]
+
+        self.t_at_turn_interpolator = xd.FunctionPieceWiseLinear(
+                                x=i_turn_at_t_samples, y=t_s)
+        self.p0c_interpolator = xd.FunctionPieceWiseLinear(
+                                x=t_s, y=np.array(p.p0c))
+        self.line = line
+
+        self.needs_complete = False
+        del self.p0c
+        del self.kinetic_energy0
+
+    def get_t_s_at_turn(self, i_turn):
+        assert not self.needs_complete, 'EnergyProgram not complete'
+        assert self.line is not None, 'EnergyProgram not associated to a line'
+        if (i_turn > self.t_at_turn_interpolator.x[-1]).any():
+            raise ValueError('`i_turn` outside program range not yet supported')
+        out = self.t_at_turn_interpolator(i_turn)
+
+        return out
+
+    def get_p0c_at_t_s(self, t_s):
+        assert not self.needs_complete, 'EnergyProgram not complete'
+        assert self.line is not None, 'EnergyProgram not associated to a line'
+        return self.p0c_interpolator(t_s)
+
+    def get_beta0_at_t_s(self, t_s):
+        p0c = self.get_p0c_at_t_s(t_s)
+        # I use a particle to make the conversions
+        p = xt.Particles(p0c=p0c, mass0=self.line.particle_ref.mass0)
+        if np.isscalar(t_s):
+            return p.beta0[0]
+        else:
+            return p.beta0
+
+    def get_kinetic_energy0_at_t_s(self, t_s):
+        p0c = self.get_p0c_at_t_s(t_s)
+        # I use a particle to make the conversions
+        p = xt.Particles(p0c=p0c, mass0=self.line.particle_ref.mass0)
+        energy0 = p.energy0
+        kinetic_energy0 = energy0 - self.line.particle_ref.mass0
+        if np.isscalar(t_s):
+            return kinetic_energy0[0]
+        else:
+            return kinetic_energy0
+
+    def get_frev_at_t_s(self, t_s):
+        beta0 = self.get_beta0_at_t_s(t_s)
+        circumference = self.line.get_length()
+        return beta0 * clight / circumference
+
+    def get_p0c_increse_per_turn_at_t_s(self, t_s):
+        beta0 = self.get_beta0_at_t_s(t_s)
+        circumference = self.line.get_length()
+        T_rev = circumference / (beta0 * clight)
+        return 0.5 * (self.get_p0c_at_t_s(t_s + T_rev)
+                      - self.get_p0c_at_t_s(t_s - T_rev))
+
+    @property
+    def t_turn_s_line(self):
+        raise ValueError('only setter allowed')
+
+    @t_turn_s_line.setter
+    def t_turn_s_line(self, value):
+        p0c = self.get_p0c_at_t_s(value)
+        self.line.particle_ref.update_p0c_and_energy_deviations(p0c=p0c)
+
+    def to_dict(self):
+        assert not self.needs_complete, 'EnergyProgram not completed'
+        return {
+            '__class__': self.__class__.__name__,
+            't_at_turn_interpolator': self.t_at_turn_interpolator.to_dict(),
+            'p0c_interpolator': self.p0c_interpolator.to_dict()}
+
+    @classmethod
+    def from_dict(cls, dct):
+        self = cls.__new__(cls)
+        self.t_at_turn_interpolator = xd.FunctionPieceWiseLinear.from_dict(
+                                        dct['t_at_turn_interpolator'])
+        self.p0c_interpolator = xd.FunctionPieceWiseLinear.from_dict(
+                                        dct['p0c_interpolator'])
+        self.needs_complete = False
+        return self
+
+    def copy(self, _context=None, _buffer=None, _offeset=None):
+        return self.from_dict(self.to_dict())
+
+def _vars_unused(line):
+    if line._xdeps_vref is None:
+        return True
+    if (len(line.vars.keys()) == 2
+        and '__vary_default' in line.vars.keys()
+        and 't_turn_s' in line.vars.keys()):
+        return True
+    return False

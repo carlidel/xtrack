@@ -83,6 +83,15 @@ class Drift(BeamElement):
         container[slice_name] = Drift(_buffer=_buffer)
         container[slice_name].length = _get_expr(container[thick_name].length) * weight
 
+    @classmethod
+    def add_thick_slice(cls, weight, container, name, slice_name, _buffer=None):
+        cls.add_slice(weight, container, name, slice_name, _buffer=_buffer)
+
+    @staticmethod
+    def delete_element_ref(ref):
+        _unregister_if_preset(ref.length)
+        _unregister_if_preset(ref)
+
 
 class Henonmap(BeamElement):
     '''Beam element representing a Henon-like map with an arbitrary polynomial kick.
@@ -537,6 +546,7 @@ class Cavity(BeamElement):
         'frequency': xo.Float64,
         'lag': xo.Float64,
         'lag_taper': xo.Float64,
+        'absolute_time': xo.Int64,
         }
 
     _extra_c_sources = [
@@ -753,6 +763,7 @@ class SRotation(BeamElement):
     has_backtrack = True
 
     _extra_c_sources = [
+        _pkg_root.joinpath('beam_elements/elements_src/track_srotation.h'),
         _pkg_root.joinpath('beam_elements/elements_src/srotation.h')]
 
     _store_in_to_dict = ['angle']
@@ -977,7 +988,7 @@ class YRotation(BeamElement):
 
 
 class ZetaShift(BeamElement):
-    '''Beam element modeling a time delat.
+    '''Beam element modeling a time delay.
 
     Parameters
     ----------
@@ -1135,6 +1146,8 @@ class SimpleThinQuadrupole(BeamElement):
         'knl': xo.Float64[2],
     }
 
+    has_backtrack = True
+
     _extra_c_sources = [
         _pkg_root.joinpath('beam_elements/elements_src/simplethinquadrupole.h')]
 
@@ -1179,7 +1192,7 @@ class SimpleThinQuadrupole(BeamElement):
     )
 
 
-class CombinedFunctionMagnet(BeamElement):
+class Bend(BeamElement):
     isthick = True
     has_backtrack = True
 
@@ -1193,17 +1206,19 @@ class CombinedFunctionMagnet(BeamElement):
         'num_multipole_kicks': xo.Int64,
         'order': xo.Int64,
         'inv_factorial_order': xo.Float64,
+        'model': xo.Int64,
     }
 
     _rename = {
         'order': '_order',
+        'model': '_model'
     }
 
     _extra_c_sources = [
         _pkg_root.joinpath('beam_elements/elements_src/drift.h'),
+        _pkg_root.joinpath('beam_elements/elements_src/track_thick_bend.h'),
         _pkg_root.joinpath('beam_elements/elements_src/track_thick_cfd.h'),
-        _pkg_root.joinpath('beam_elements/elements_src/multipolar_kick.h'),
-        _pkg_root.joinpath('beam_elements/elements_src/combinedfunctionmagnet.h'),
+        _pkg_root.joinpath('beam_elements/elements_src/bend.h'),
     ]
 
     def __init__(self, **kwargs):
@@ -1241,6 +1256,8 @@ class CombinedFunctionMagnet(BeamElement):
         if kwargs.get('length', 0.0) == 0.0 and not '_xobject' in kwargs:
             raise ValueError("A thick element must have a length.")
 
+        model = kwargs.pop('model', None)
+
         knl = kwargs.get('knl', np.array([]))
         ksl = kwargs.get('ksl', np.array([]))
         order_from_kl = max(len(knl), len(ksl)) - 1
@@ -1254,6 +1271,8 @@ class CombinedFunctionMagnet(BeamElement):
 
         self.xoinitialize(**kwargs)
 
+        if model is not None:
+            self.model = model
         self.order = order
 
     @property
@@ -1264,6 +1283,28 @@ class CombinedFunctionMagnet(BeamElement):
     def order(self, value):
         self._order = value
         self.inv_factorial_order = 1.0 / factorial(value, exact=True)
+
+    @property
+    def model(self):
+        return {
+            0: 'adaptive',
+            1: 'full', # same as adaptive (for backward compatibility)
+            2: 'bend-kick-bend',
+            3: 'rot-kick-rot',
+            4: 'expanded'
+        }[self._model]
+
+    @model.setter
+    def model(self, value):
+        assert value in ['adaptive', 'full', 'bend-kick-bend',
+                            'rot-kick-rot', 'expanded']
+        self._model = {
+            'adaptive': 0,
+            'full': 1,
+            'bend-kick-bend': 2,
+            'rot-kick-rot': 3,
+            'expanded': 4
+        }[value]
 
     @property
     def hxl(self): return self.h * self.length
@@ -1308,21 +1349,24 @@ class CombinedFunctionMagnet(BeamElement):
     def add_thick_slice(cls, weight, container, name, slice_name, _buffer=None):
         self_or_ref = container[name]
         container[slice_name] = cls(
-            length=self_or_ref.length * weight,
-            num_multipole_kicks=self_or_ref.num_multipole_kicks,
-            order=self_or_ref.order,
+            length=999.,
+            order=4,
             _buffer=_buffer,
         )
         ref = container[slice_name]
 
+        ref.length = _get_expr(self_or_ref.length) * weight
+        ref.num_multipole_kicks = _get_expr(self_or_ref.num_multipole_kicks)
+        ref.order = _get_expr(self_or_ref.order)
         ref.k0 = _get_expr(self_or_ref.k0)
-        ref.k1 = _get_expr(self_or_ref.k1)
         ref.h = _get_expr(self_or_ref.h)
+        ref.k1 = _get_expr(self_or_ref.k1)
+        ref.model = _get_expr(self_or_ref.model)
 
-        for ii in range(len(self_or_ref.knl)):
+        for ii in range(5):
             ref.knl[ii] = _get_expr(self_or_ref.knl[ii]) * weight
 
-        for ii in range(len(self_or_ref.ksl)):
+        for ii in range(5):
             ref.ksl[ii] = _get_expr(self_or_ref.ksl[ii]) * weight
 
     @staticmethod
@@ -1343,6 +1387,20 @@ class CombinedFunctionMagnet(BeamElement):
         _unregister_if_preset(ref)
 
 class Sextupole(BeamElement):
+
+    """
+    Sextupole element.
+
+    Parameters
+    ----------
+    k2 : float
+        Strength of the sextupole component in m^-3.
+    k2s : float
+        Strength of the skew sextupole component in m^-3.
+    length : float
+        Length of the element in meters.
+    """
+
     isthick = True
     has_backtrack = True
 
@@ -1377,10 +1435,81 @@ class Sextupole(BeamElement):
 
         ref.order = 2
 
+    @classmethod
+    def add_thick_slice(cls, weight, container, name, slice_name, _buffer=None):
+        self_or_ref = container[name]
+        container[slice_name] = cls(_buffer=_buffer)
+        ref = container[slice_name]
+
+        ref.length = _get_expr(self_or_ref.length) * weight
+        ref.k2 = _get_expr(self_or_ref.k2)
+        ref.k2s = _get_expr(self_or_ref.k2s)
+
     @staticmethod
     def delete_element_ref(ref):
         # Remove the scalar fields
         for field in ['k2', 'k2s', 'length']:
+            _unregister_if_preset(getattr(ref, field))
+
+        # Remove the ref to the element itself
+        _unregister_if_preset(ref)
+
+
+class Octupole(BeamElement):
+
+    """
+    Octupole element.
+
+    Parameters
+    ----------
+    k3 : float
+        Strength of the octupole component in m^-3.
+    k3s : float
+        Strength of the skew octupole component in m^-3.
+    length : float
+        Length of the element in meters.
+    """
+
+    isthick = True
+    has_backtrack = True
+
+    _xofields={
+        'k3': xo.Float64,
+        'k3s': xo.Float64,
+        'length': xo.Float64,
+    }
+
+    _extra_c_sources = [
+        _pkg_root.joinpath('beam_elements/elements_src/drift.h'),
+        _pkg_root.joinpath('beam_elements/elements_src/octupole.h'),
+    ]
+
+    @staticmethod
+    def add_slice(weight, container, thick_name, slice_name, _buffer=None):
+        self_or_ref = container[thick_name]
+
+        container[slice_name] = Multipole(knl=np.zeros(4), ksl=np.zeros(4),
+                                          _buffer=_buffer)
+        ref = container[slice_name]
+
+        ref.knl[0] = 0.
+        ref.knl[1] = 0.
+        ref.knl[2] = 0.
+        ref.knl[3] = weight * (
+            _get_expr(self_or_ref.k3) * _get_expr(self_or_ref.length))
+
+        ref.ksl[0] = 0.
+        ref.ksl[1] = 0.
+        ref.ksl[2] = 0.
+        ref.ksl[2] = weight * (
+            _get_expr(self_or_ref.k3s) * _get_expr(self_or_ref.length))
+
+        ref.order = 3
+
+    @staticmethod
+    def delete_element_ref(ref):
+        # Remove the scalar fields
+        for field in ['k3', 'k3s', 'length']:
             _unregister_if_preset(getattr(ref, field))
 
         # Remove the ref to the element itself
@@ -1393,22 +1522,14 @@ class Quadrupole(BeamElement):
 
     _xofields={
         'k1': xo.Float64,
+        'k1s': xo.Float64,
         'length': xo.Float64,
-        'knl': xo.Float64[5],
-        'ksl': xo.Float64[5],
-        'num_multipole_kicks': xo.Int64,
-        'order': xo.Int64,
-        'inv_factorial_order': xo.Float64,
-    }
-
-    _rename = {
-        'order': '_order',
     }
 
     _extra_c_sources = [
         _pkg_root.joinpath('beam_elements/elements_src/drift.h'),
         _pkg_root.joinpath('beam_elements/elements_src/track_thick_cfd.h'),
-        _pkg_root.joinpath('beam_elements/elements_src/multipolar_kick.h'),
+        _pkg_root.joinpath('beam_elements/elements_src/track_srotation.h'),
         _pkg_root.joinpath('beam_elements/elements_src/quadrupole.h'),
     ]
 
@@ -1421,14 +1542,10 @@ class Quadrupole(BeamElement):
         ----------
         k1 : float
             Strength of the quadrupole component in m^-2.
+        k1s : float
+            Strength of the skew quadrupole component in m^-2.
         length : float
             Length of the element in meters.
-        knl : array_like, optional
-            Integrated strength of the high-order normal multipolar components
-            (knl[0] and knl[1] should not be used).
-        ksl : array_like, optional
-            Integrated strength of the high-order skew multipolar components
-            (ksl[0] and ksl[1] should not be used).
         """
 
         if '_xobject' in kwargs.keys() and kwargs['_xobject'] is not None:
@@ -1438,35 +1555,20 @@ class Quadrupole(BeamElement):
         if kwargs.get('length', 0.0) == 0.0 and not '_xobject' in kwargs:
             raise ValueError("A thick element must have a length.")
 
-        knl = kwargs.get('knl', np.array([]))
-        ksl = kwargs.get('ksl', np.array([]))
-        order_from_kl = max(len(knl), len(ksl)) - 1
-        order = kwargs.get('order', max(4, order_from_kl))
-
-        if order > 4:
-            raise NotImplementedError # Untested
-
-        kwargs['knl'] = np.pad(knl, (0, 5 - len(knl)), 'constant')
-        kwargs['ksl'] = np.pad(ksl, (0, 5 - len(ksl)), 'constant')
-
         self.xoinitialize(**kwargs)
 
-        self.order = order
+    @classmethod
+    def from_dict(cls, dct, **kwargs):
+        if 'num_multipole_kicks' in dct:
+            assert dct['num_multipole_kicks'] == 0
+            dct.pop('num_multipole_kicks')
+            dct.pop('knl', None)
+            dct.pop('ksl', None)
+            dct.pop('order', None)
+            dct.pop('inv_factorial_order', None)
 
-    @property
-    def order(self):
-        return self._order
+        return cls(**dct, **kwargs)
 
-    @order.setter
-    def order(self, value):
-        self._order = value
-        self.inv_factorial_order = 1.0 / factorial(value, exact=True)
-
-    @property
-    def hxl(self): return self.h * self.length
-
-    @property
-    def hyl(self): return 0.0
 
     @property
     def radiation_flag(self): return 0.0
@@ -1481,55 +1583,30 @@ class Quadrupole(BeamElement):
 
         ref.knl[0] = 0.
         ref.knl[1] = (_get_expr(self_or_ref.k1) * _get_expr(self_or_ref.length)
-                      + _get_expr(self_or_ref.knl[1])) * weight
-
-        order = 1
-        for ii in range(2, 5):
-            ref.knl[ii] = _get_expr(self_or_ref.knl[ii]) * weight
-
-            if _nonzero(ref.knl[ii]):
-                order = max(order, ii)
-
-        for ii in range(5):
-            ref.ksl[ii] = _get_expr(self_or_ref.ksl[ii]) * weight
-
-            if _nonzero(self_or_ref.ksl[ii]):  # update in the same way for ksl
-                order = max(order, ii)
+                      ) * weight
+        ref.ksl[1] = (_get_expr(self_or_ref.k1s) * _get_expr(self_or_ref.length)
+                      ) * weight
 
         ref.hxl = 0
         ref.length = _get_expr(self_or_ref.length) * weight
-        ref.order = order
 
     @classmethod
     def add_thick_slice(cls, weight, container, name, slice_name, _buffer=None):
         self_or_ref = container[name]
         container[slice_name] = cls(
-            length=_get_expr(self_or_ref.length) * weight,
-            num_multipole_kicks=_get_expr(self_or_ref.num_multipole_kicks),
-            order=_get_expr(self_or_ref.order),
+            length=999.,
             _buffer=_buffer,
         )
         ref = container[slice_name]
 
+        ref.length = _get_expr(self_or_ref.length) * weight
         ref.k1 = _get_expr(self_or_ref.k1)
-
-        for ii in range(len(_get_expr(self_or_ref.knl))):
-            ref.knl[ii] = _get_expr(self_or_ref.knl[ii]) * weight
-
-        for ii in range(len(_get_expr(self_or_ref.ksl))):
-            ref.ksl[ii] = _get_expr(self_or_ref.ksl[ii]) * weight
+        ref.k1s = _get_expr(self_or_ref.k1s)
 
     @staticmethod
     def delete_element_ref(ref):
-        # Remove the array fields
-        for field in ['knl', 'ksl']:
-            for ii in range(5):
-                _unregister_if_preset(getattr(ref, field)[ii])
-
         # Remove the scalar fields
-        for field in [
-            'k1', 'length', 'num_multipole_kicks', 'order', 'inv_factorial_order',
-        ]:
+        for field in ['k1', 'k1s', 'length']:
             _unregister_if_preset(getattr(ref, field))
 
         # Remove the ref to the element itself
@@ -1538,17 +1615,24 @@ class Quadrupole(BeamElement):
 
 class Solenoid(BeamElement):
     isthick = True
+    has_backtrack = True
 
     _xofields = {
         'length': xo.Float64,
         'ks': xo.Float64,
         'ksi': xo.Float64,
+        'radiation_flag': xo.Int64,
     }
 
     _extra_c_sources = [
+        _pkg_root.joinpath('headers/synrad_spectrum.h'),
         _pkg_root.joinpath('beam_elements/elements_src/drift.h'),
         _pkg_root.joinpath('beam_elements/elements_src/solenoid.h'),
     ]
+
+    _depends_on = [RandomUniform, RandomExponential]
+
+    _internal_record_class = SynchrotronRadiationRecord
 
     def __init__(self, length=0, ks=0, ksi=0, **kwargs):
         """
@@ -1560,7 +1644,7 @@ class Solenoid(BeamElement):
             Length of the element in meters.
         ks : float
             Strength of the solenoid component in rad / m. Only to be specified
-            when the element is thin, i.e. when `length` == 0.
+            when the element is thin, i.e. when `length` is 0.
         ksi : float
             Integrated strength of the solenoid component in rad.
         """
@@ -1569,7 +1653,7 @@ class Solenoid(BeamElement):
             self.xoinitialize(**kwargs)
             return
 
-        if length == 0:
+        if ksi != 0:
             # Fail when trying to create a thin solenoid, as these are not
             # tested yet
             raise NotImplementedError('Thin solenoids are not implemented yet.')
@@ -1583,182 +1667,15 @@ class Solenoid(BeamElement):
         self.xoinitialize(length=length, ks=ks, ksi=ksi, **kwargs)
 
 
-class Bend(BeamElement):
-    isthick = True
-    has_backtrack = True
+class CombinedFunctionMagnet():
 
-    _xofields={
-        'k0': xo.Float64,
-        'h': xo.Float64,
-        'length': xo.Float64,
-        'knl': xo.Float64[5],
-        'ksl': xo.Float64[5],
-        'num_multipole_kicks': xo.Int64,
-        'order': xo.Int64,
-        'inv_factorial_order': xo.Float64,
-        'model': xo.Int64,
-    }
-
-    _rename = {
-        'order': '_order',
-        'model': '_model'
-    }
-
-    _extra_c_sources = [
-        _pkg_root.joinpath('beam_elements/elements_src/drift.h'),
-        _pkg_root.joinpath('beam_elements/elements_src/track_thick_cfd.h'),
-        _pkg_root.joinpath('beam_elements/elements_src/track_thick_bend.h'),
-        _pkg_root.joinpath('beam_elements/elements_src/multipolar_kick.h'),
-        _pkg_root.joinpath('beam_elements/elements_src/bend.h'),
-    ]
-
-    def __init__(self, **kwargs):
-
-        """
-        Bending magnet element.
-
-        Parameters
-        ----------
-        k0 : float
-            Strength of the dipole component in m^-1.
-        h : float
-            Curvature of the reference trajectory in m^-1.
-        length : float
-            Length of the element in m.
-        knl : array_like, optional
-            Integrated strength of the high-order normal multipolar components
-            (knl[0] and knl[1] should not be used).
-        ksl : array_like, optional
-            Integrated strength of the high-order skew multipolar components
-            (ksl[0] and ksl[1] should not be used).
-        model: str, optional
-            Model used for the computation. It can be 'expanded' or 'full'.
-            Default is 'expanded'.
-        """
-
-        if '_xobject' in kwargs.keys() and kwargs['_xobject'] is not None:
-            self.xoinitialize(**kwargs)
-            return
-
-        if kwargs.get('length', 0.0) == 0.0 and not '_xobject' in kwargs:
-            raise ValueError("A thick element must have a length.")
-
-        model = kwargs.pop('model', None)
-
-        knl = kwargs.get('knl', np.array([]))
-        ksl = kwargs.get('ksl', np.array([]))
-        order_from_kl = max(len(knl), len(ksl)) - 1
-        order = kwargs.get('order', max(order_from_kl, 4))
-
-        if order > 4:
-            raise NotImplementedError # Untested
-
-        kwargs['knl'] = np.pad(knl, (0, 5 - len(knl)), 'constant')
-        kwargs['ksl'] = np.pad(ksl, (0, 5 - len(ksl)), 'constant')
-
-        self.xoinitialize(**kwargs)
-
-        if model is not None:
-            self.model = model
-        self.order = order
-
-    @property
-    def model(self):
-        return {
-            0: 'expanded',
-            1: 'full'
-        }[self._model]
-
-    @model.setter
-    def model(self, value):
-        assert value in ['expanded', 'full']
-        self._model = {
-            'expanded': 0,
-            'full': 1
-        }[value]
-
-    @property
-    def order(self):
-        return self._order
-
-    @order.setter
-    def order(self, value):
-        self._order = value
-        self.inv_factorial_order = 1.0 / factorial(value, exact=True)
-
-    @property
-    def hxl(self): return self.h * self.length
-
-    @property
-    def hyl(self): return 0.0
-
-    @property
-    def radiation_flag(self): return 0.0
-
-    @staticmethod
-    def add_slice(weight, container, thick_name, slice_name, _buffer=None):
-        self_or_ref = container[thick_name]
-
-        container[slice_name] = Multipole(knl=np.zeros(5), ksl=np.zeros(5),
-                                          _buffer=_buffer)
-        ref = container[slice_name]
-
-        ref.knl[0] = (_get_expr(self_or_ref.k0) * _get_expr(self_or_ref.length)
-                      + _get_expr(self_or_ref.knl[0])) * weight
-        order = 0
-        for ii in range(1, 5):
-            ref.knl[ii] = _get_expr(self_or_ref.knl[ii]) * weight
-
-            if _nonzero(self_or_ref.knl[ii]):  # order is max ii where knl[ii] is expr or nonzero
-                order = ii
-
-        for ii in range(5):
-            ref.ksl[ii] = _get_expr(self_or_ref.ksl[ii]) * weight
-
-            if _nonzero(self_or_ref.ksl[ii]):  # update in the same way for ksl
-                order = max(order, ii)
-
-        ref.hxl = _get_expr(self_or_ref.h) * _get_expr(self_or_ref.length) * weight
-        ref.length = _get_expr(self_or_ref.length) * weight
-        ref.order = order
+    def __init__(self, *args, **kwargs):
+        raise TypeError('`CombinedFunctionMagnet` is supported anymore. '
+                        'Use `Bend` instead.')
 
     @classmethod
-    def add_thick_slice(cls, weight, container, name, slice_name, _buffer=None):
-        self_or_ref = container[name]
-        container[slice_name] = cls(
-            length=self_or_ref.length * weight,
-            num_multipole_kicks=self_or_ref.num_multipole_kicks,
-            order=self_or_ref.order,
-            _buffer=_buffer,
-        )
-        ref = container[slice_name]
-
-        ref.k0 = _get_expr(self_or_ref.k0)
-        ref.h = _get_expr(self_or_ref.h)
-        ref.length = _get_expr(self_or_ref.length) * weight
-
-        for ii in range(len(self_or_ref.knl)):
-            ref.knl[ii] = _get_expr(self_or_ref.knl[ii]) * weight
-
-        for ii in range(len(self_or_ref.ksl)):
-            ref.ksl[ii] = _get_expr(self_or_ref.ksl[ii]) * weight
-
-    @staticmethod
-    def delete_element_ref(ref):
-        # Remove the array fields
-        for field in ['knl', 'ksl']:
-            for ii in range(5):
-                _unregister_if_preset(getattr(ref, field)[ii])
-
-        # Remove the scalar fields
-        for field in [
-            'k0', 'h', 'length', 'num_multipole_kicks', 'order',
-            'inv_factorial_order',
-        ]:
-            _unregister_if_preset(getattr(ref, field))
-
-        # Remove the ref to the element itself
-        _unregister_if_preset(ref[field])
+    def from_dict(cls, dct):
+        return Bend(**dct)
 
 
 class Fringe(BeamElement):
@@ -1813,7 +1730,7 @@ class Wedge(BeamElement):
     ]
 
     def __init__(self, **kwargs):
-        raise NotImplementedError # Untested
+        # raise NotImplementedError # Untested
         self.xoinitialize(**kwargs)
 
 
@@ -1833,6 +1750,8 @@ class SimpleThinBend(BeamElement):
         'hxl': xo.Float64,
         'length': xo.Float64,
     }
+
+    has_backtrack = True
 
     _extra_c_sources = [
         _pkg_root.joinpath('beam_elements/elements_src/simplethinbend.h')]
@@ -1997,9 +1916,9 @@ class DipoleEdge(BeamElement):
     fint : float
         Fringe integral.
     e1_fd : float
-        Term added to e1 only of for the linear mode and only in the vertical
+        Term added to e1 only for the linear mode and only in the vertical
         plane to acconut for non zero angle in the closed orbit when entering
-        the finger field (feed down effect).
+        the fringe field (feed down effect).
     model : str
         Model to be used for the edge. It can be 'linear', 'full' or 'suppress'.
         Default is 'linear'.
@@ -2189,12 +2108,12 @@ class LineSegmentMap(BeamElement):
         'qx': xo.Float64,
         'qy': xo.Float64,
 
-        'dqx': xo.Float64,
-        'dqy': xo.Float64,
-        'detx_x': xo.Float64,
-        'detx_y': xo.Float64,
-        'dety_y': xo.Float64,
-        'dety_x': xo.Float64,
+        'coeffs_dqx': xo.Float64[:],
+        'coeffs_dqy': xo.Float64[:],
+        'det_xx': xo.Float64,
+        'det_xy': xo.Float64,
+        'det_yy': xo.Float64,
+        'det_yx': xo.Float64,
 
         'betx': xo.Float64[2],
         'bety': xo.Float64[2],
@@ -2258,8 +2177,8 @@ class LineSegmentMap(BeamElement):
             momentum_compaction_factor=None,
             slippage_length=None,
             voltage_rf=None, frequency_rf=None, lag_rf=None,
-            dqx=0.0, dqy=0.0,
-            detx_x=0.0, detx_y=0.0, dety_y=0.0, dety_x=0.0,
+            dqx=0.0, dqy=0.0, ddqx=0.0, ddqy=0.0, dnqx=None, dnqy=None,
+            det_xx=0.0, det_xy=0.0, det_yy=0.0, det_yx=0.0,
             energy_increment=0.0, energy_ref_increment=0.0,
             damping_rate_x = 0.0, damping_rate_y = 0.0, damping_rate_s = 0.0,
             equ_emit_x = 0.0, equ_emit_y = 0.0, equ_emit_s = 0.0,
@@ -2349,32 +2268,60 @@ class LineSegmentMap(BeamElement):
         lag_rf : list of float
             List of lag of the RF kicks in the segment. Only used if
             ``longitudinal_mode`` is ``'nonlinear'`` or ``'linear_fixed_rf'``.
-        dqx : float
-            Horizontal chromaticity of the segment.
-        dqy : float
-            Vertical chromaticity of the segment.
-        detx_x : float
-            Anharmonicity xx coefficient. Optional, default is ``0``.
-        detx_y : float
-            Anharmonicity xy coefficient. Optional, default is ``0``.
-        dety_y : float
-            Anharmonicity yy coefficient. Optional, default is ``0``.
+        dqx : float or list of float
+            Horizontal linear chromaticity of the segment.
+        dqy : float or list of float
+            Vertical linear chromaticity of the segment.
+        ddqx: float
+            Horizontal second order chromaticity of the segment
+        ddqy: float
+            Vertical second order chromaticity of the segment
+        dnqx: list of float
+            List of horizontal chromaticities up to any order. The first element
+            of the list is the horizontal tune, the second element is the
+            horizontal linear chromaticity, the third element the horizontal
+            second order chromaticity and so on. It can be specified only if the
+            horizontal tune, and chromaticities are not specified.
+        dnqy: list of float
+            List of vertical chromaticities up to any order. The first element
+            of the list is the vertical tune, the second element is the
+            vertical linear chromaticity, the third element the vertical
+            second order chromaticity and so on. It can be specified only if the
+            vertical tune, and chromaticities are not specified.
+        det_xx : float
+            Anharmonicity xx coefficient (i.e. dqx / dJx, where Jx is the horizontal
+            action). Optional, default is ``0``.
+        det_xy : float
+            Anharmonicity xy coefficient (i.e. dqx / dJy, where Jy is the vertical
+            action). Optional, default is ``0``.
+        det_yx : float
+            Anharmonicity yx coefficient (i.e. dqy / dJx, where Jx is the horizontal
+            action). Optional, default is ``0``.
+        det_yy : float
+            Anharmonicity yy coefficient (i.e. dqy / dJy, where Jy is the vertical
+            action). Optional, default is ``0``.
         energy_increment : float
             Energy increment of the segment in eV.
         energy_ref_increment : float
             Increment of the reference energy in eV.
         damping_rate_x : float
-            Horizontal damping rate on the particles motion. Optional, default is ``0``.
+            Horizontal damping rate on the particles motion defined such that
+            emit_x = emit_x(n=0) * exp(-damping_rate_x * n) where n is the turn
+            number. Optional, default is ``0``.
         damping_rate_y : float
-            Vertical damping rate on the particles motion. Optional, default is ``0``.
+            Vertical damping rate on the particles motion defined such that
+            emit_y = emit_y(n=0) * exp(-damping_rate_y * n) where n is the turn
+            number. Optional, default is ``0``.
         damping_rate_s : float
-            Longitudinal damping rate on the particles motion. Optional, default is ``0``.
+            Longitudinal damping rate on the particles motion defined such that
+            emit_s = emit_s(n=0) * exp(-damping_rate_s * n) where n is the turn
+            number. Optional, default is ``0``.
         equ_emit_x : float
-            Horizontal equilibrium emittance. Optional.
+            Horizontal equilibrium emittance (geometric). Optional.
         equ_emit_y : float
-            Vertical equilibrium emittance. Optional.
+            Vertical equilibrium emittance (geometric). Optional.
         equ_emit_s : float
-            Longitudinal equilibrium emittance. Optional.
+            Longitudinal equilibrium emittance (geometric). Optional.
         gauss_noise_ampl_x : float
             Amplitude of Gaussian noise on the horizontal position. Optional, default is ``0``.
         gauss_noise_ampl_px : float
@@ -2394,16 +2341,40 @@ class LineSegmentMap(BeamElement):
             self._xobject = nargs['_xobject']
             return
 
-        assert longitudinal_mode in ['linear_fixed_qs', 'nonlinear', 'linear_fixed_rf', None]
+        assert longitudinal_mode in [
+            'linear_fixed_qs', 'nonlinear', 'linear_fixed_rf', 'frozen', None]
+
+        if dnqx is not None:
+            assert qx == 0 and dqx == 0 and ddqx == 0
+            qx = dnqx[0]
+        else:
+            dnqx = [qx]
+            if dqx != 0:
+                dnqx.append(dqx)
+            if ddqx != 0:
+                dnqx.append(ddqx)
+
+        if dnqy is not None:
+            assert qy == 0 and dqy == 0 and ddqy == 0
+            qy = dnqy[0]
+        else:
+            dnqy = [qy]
+            if dqy != 0:
+                dnqy.append(dqy)
+            if ddqy != 0:
+                dnqy.append(ddqy)
+
+        coeffs_dqx = [dnqx[i] / float(factorial(i)) for i in range(len(dnqx))]
+        coeffs_dqy = [dnqy[i] / float(factorial(i)) for i in range(len(dnqy))]
 
         nargs['qx'] = qx
         nargs['qy'] = qy
-        nargs['dqx'] = dqx
-        nargs['dqy'] = dqy
-        nargs['detx_x'] = detx_x
-        nargs['detx_y'] = detx_y
-        nargs['dety_y'] = dety_y
-        nargs['dety_x'] = dety_x
+        nargs['coeffs_dqx'] = coeffs_dqx
+        nargs['coeffs_dqy'] = coeffs_dqy
+        nargs['det_xx'] = det_xx
+        nargs['det_xy'] = det_xy
+        nargs['det_yy'] = det_yy
+        nargs['det_yx'] = det_yx
         nargs['length'] = length
 
         if longitudinal_mode is None:
@@ -2654,62 +2625,8 @@ class FirstOrderTaylorMap(BeamElement):
 
 class LinearTransferMatrix(BeamElement):
     _xofields={
-        'no_detuning': xo.Int64,
-        'q_x': xo.Float64,
-        'q_y': xo.Float64,
-        'cos_s': xo.Float64,
-        'sin_s': xo.Float64,
-        'beta_x_0': xo.Float64,
-        'beta_y_0': xo.Float64,
-        'beta_ratio_x': xo.Float64,
-        'beta_prod_x': xo.Float64,
-        'beta_ratio_y': xo.Float64,
-        'beta_prod_y': xo.Float64,
-        'alpha_x_0': xo.Float64,
-        'alpha_x_1': xo.Float64,
-        'alpha_y_0': xo.Float64,
-        'alpha_y_1': xo.Float64,
-        'disp_x_0': xo.Float64,
-        'disp_x_1': xo.Float64,
-        'disp_y_0': xo.Float64,
-        'disp_y_1': xo.Float64,
-        'beta_s': xo.Float64,
-        'energy_ref_increment': xo.Float64,
-        'energy_increment': xo.Float64,
-        'chroma_x': xo.Float64,
-        'chroma_y': xo.Float64,
-        'detx_x': xo.Float64,
-        'detx_y': xo.Float64,
-        'dety_y': xo.Float64,
-        'dety_x': xo.Float64,
-        'x_ref_0': xo.Float64,
-        'px_ref_0': xo.Float64,
-        'y_ref_0': xo.Float64,
-        'py_ref_0': xo.Float64,
-        'x_ref_1': xo.Float64,
-        'px_ref_1': xo.Float64,
-        'y_ref_1': xo.Float64,
-        'py_ref_1': xo.Float64,
-        'length': xo.Float64,
-        'uncorrelated_rad_damping': xo.Int64,
-        'damping_factor_x':xo.Float64,
-        'damping_factor_y':xo.Float64,
-        'damping_factor_s':xo.Float64,
-        'uncorrelated_gauss_noise': xo.Int64,
-        'gauss_noise_ampl_x':xo.Float64,
-        'gauss_noise_ampl_px':xo.Float64,
-        'gauss_noise_ampl_y':xo.Float64,
-        'gauss_noise_ampl_py':xo.Float64,
-        'gauss_noise_ampl_zeta':xo.Float64,
-        'gauss_noise_ampl_delta':xo.Float64,
+    'discontinued': xo.Int64
         }
-
-    _depends_on = [RandomNormal]
-    isthick = True
-
-    _extra_c_sources = [
-        _pkg_root.joinpath('headers/constants.h'),
-        _pkg_root.joinpath('beam_elements/elements_src/lineartransfermatrix.h')]
 
     def __init__(self, Q_x=0, Q_y=0,
                      beta_x_0=1.0, beta_x_1=1.0, beta_y_0=1.0, beta_y_1=1.0,
@@ -2717,7 +2634,7 @@ class LinearTransferMatrix(BeamElement):
                      disp_x_0=0.0, disp_x_1=0.0, disp_y_0=0.0, disp_y_1=0.0,
                      Q_s=0.0, beta_s=1.0,
                      chroma_x=0.0, chroma_y=0.0,
-                     detx_x=0.0, detx_y=0.0, dety_y=0.0, dety_x=0.0,
+                     det_xx=0.0, det_xy=0.0, det_yy=0.0, det_yx=0.0,
                      energy_increment=0.0, energy_ref_increment=0.0,
                      x_ref_0 = 0.0, px_ref_0 = 0.0, x_ref_1 = 0.0, px_ref_1 = 0.0,
                      y_ref_0 = 0.0, py_ref_0 = 0.0, y_ref_1 = 0.0, py_ref_1 = 0.0,
@@ -2726,143 +2643,8 @@ class LinearTransferMatrix(BeamElement):
                      gauss_noise_ampl_x=0.0,gauss_noise_ampl_px=0.0,gauss_noise_ampl_y=0.0,gauss_noise_ampl_py=0.0,gauss_noise_ampl_zeta=0.0,gauss_noise_ampl_delta=0.0,
                      **nargs):
 
-        if '_xobject' in nargs.keys() and nargs['_xobject'] is not None:
-            self.xoinitialize(**nargs)
-            return
-
-        _print('Warning: `LinearTransferMatrix` is deprecated and will be removed in the future. '
-               'Please use `LineSegmentMap` instead.')
-        if (chroma_x==0 and chroma_y==0
-            and detx_x==0 and detx_y==0 and dety_y==0 and dety_x==0):
-
-            cos_x = np.cos(2.0*np.pi*Q_x)
-            sin_x = np.sin(2.0*np.pi*Q_x)
-            cos_y = np.cos(2.0*np.pi*Q_y)
-            sin_y = np.sin(2.0*np.pi*Q_y)
-
-            nargs['no_detuning']  =  True
-            nargs['q_x'] = sin_x
-            nargs['q_y'] = sin_y
-            nargs['chroma_x'] = cos_x
-            nargs['chroma_y'] = cos_y
-            nargs['detx_x'] = 0.
-            nargs['detx_y'] = 0.
-            nargs['dety_y'] = 0.
-            nargs['dety_x'] = 0.
-        else:
-            nargs['no_detuning']  =  False
-            nargs['q_x'] = Q_x
-            nargs['q_y'] = Q_y
-            nargs['chroma_x'] = chroma_x
-            nargs['chroma_y'] = chroma_y
-            nargs['detx_x'] = detx_x
-            nargs['detx_y'] = detx_y
-            nargs['dety_y'] = dety_y
-            nargs['dety_x'] = dety_x
-
-        if Q_s is not None:
-            nargs['cos_s'] = np.cos(2.0*np.pi*Q_s)
-            nargs['sin_s'] = np.sin(2.0*np.pi*Q_s)
-        else:
-            nargs['cos_s'] = 999
-            nargs['sin_s'] = 0.
-
-        nargs['beta_x_0'] = beta_x_0
-        nargs['beta_y_0'] = beta_y_0
-        nargs['beta_ratio_x'] = np.sqrt(beta_x_1/beta_x_0)
-        nargs['beta_prod_x'] = np.sqrt(beta_x_1*beta_x_0)
-        nargs['beta_ratio_y'] = np.sqrt(beta_y_1/beta_y_0)
-        nargs['beta_prod_y'] = np.sqrt(beta_y_1*beta_y_0)
-        nargs['alpha_x_0'] = alpha_x_0
-        nargs['alpha_x_1'] = alpha_x_1
-        nargs['alpha_y_0'] = alpha_y_0
-        nargs['alpha_y_1'] = alpha_y_1
-        nargs['disp_x_0'] = disp_x_0
-        nargs['disp_x_1'] = disp_x_1
-        nargs['disp_y_0'] = disp_y_0
-        nargs['disp_y_1'] = disp_y_1
-        nargs['beta_s'] = beta_s
-        nargs['x_ref_0'] = x_ref_0
-        nargs['x_ref_1'] = x_ref_1
-        nargs['px_ref_0'] = px_ref_0
-        nargs['px_ref_1'] = px_ref_1
-        nargs['y_ref_0'] = y_ref_0
-        nargs['y_ref_1'] = y_ref_1
-        nargs['py_ref_0'] = py_ref_0
-        nargs['py_ref_1'] = py_ref_1
-        # acceleration with change of reference momentum
-        nargs['energy_ref_increment'] = energy_ref_increment
-        # acceleration without change of reference momentum
-        nargs['energy_increment'] = energy_increment
-
-        if damping_rate_x < 0.0 or damping_rate_y < 0.0 or damping_rate_s < 0.0:
-            raise ValueError('Damping rates cannot be negative')
-        if damping_rate_x > 0.0 or damping_rate_y > 0.0 or damping_rate_s > 0.0:
-            nargs['uncorrelated_rad_damping'] = True
-            nargs['damping_factor_x'] = 1.0-damping_rate_x/2.0
-            nargs['damping_factor_y'] = 1.0-damping_rate_y/2.0
-            nargs['damping_factor_s'] = 1.0-damping_rate_s/2.0
-        else:
-            nargs['uncorrelated_rad_damping'] = False
-
-        if equ_emit_x < 0.0 or equ_emit_y < 0.0 or equ_emit_s < 0.0:
-            raise ValueError('Equilibrium emittances cannot be negative')
-        nargs['uncorrelated_gauss_noise'] = False
-        nargs['gauss_noise_ampl_x'] = 0.0
-        nargs['gauss_noise_ampl_px'] = 0.0
-        nargs['gauss_noise_ampl_y'] = 0.0
-        nargs['gauss_noise_ampl_py'] = 0.0
-        nargs['gauss_noise_ampl_zeta'] = 0.0
-        nargs['gauss_noise_ampl_delta'] = 0.0
-
-        assert equ_emit_x >= 0.0
-        assert equ_emit_y >= 0.0
-        assert equ_emit_s >= 0.0
-
-        if equ_emit_x > 0.0:
-            assert alpha_x_1 == 0
-            nargs['uncorrelated_gauss_noise'] = True
-            nargs['gauss_noise_ampl_px'] = np.sqrt(equ_emit_x*damping_rate_x/beta_x_1)
-            nargs['gauss_noise_ampl_x'] = beta_x_1*nargs['gauss_noise_ampl_px']
-        if equ_emit_y > 0.0:
-            assert alpha_y_1 == 0
-            nargs['uncorrelated_gauss_noise'] = True
-            nargs['gauss_noise_ampl_py'] = np.sqrt(equ_emit_y*damping_rate_y/beta_y_1)
-            nargs['gauss_noise_ampl_y'] = beta_y_1*nargs['gauss_noise_ampl_py']
-        if equ_emit_s > 0.0:
-            nargs['uncorrelated_gauss_noise'] = True
-            nargs['gauss_noise_ampl_delta'] = np.sqrt(equ_emit_s*damping_rate_s/beta_s)
-            nargs['gauss_noise_ampl_zeta'] = beta_s*nargs['gauss_noise_ampl_delta']
-
-        assert gauss_noise_ampl_x >= 0.0
-        assert gauss_noise_ampl_px >= 0.0
-        assert gauss_noise_ampl_y >= 0.0
-        assert gauss_noise_ampl_py >= 0.0
-        assert gauss_noise_ampl_zeta >= 0.0
-        assert gauss_noise_ampl_delta >= 0.0
-
-        if gauss_noise_ampl_x > 0.0 or gauss_noise_ampl_px > 0.0 or gauss_noise_ampl_y > 0.0 or gauss_noise_ampl_py > 0.0 or gauss_noise_ampl_zeta > 0.0 or gauss_noise_ampl_delta > 0.0:
-            nargs['uncorrelated_gauss_noise'] = True
-            nargs['gauss_noise_ampl_x'] = np.sqrt(nargs['gauss_noise_ampl_x']**2+gauss_noise_ampl_x**2)
-            nargs['gauss_noise_ampl_px'] = np.sqrt(nargs['gauss_noise_ampl_px']**2+gauss_noise_ampl_px**2)
-            nargs['gauss_noise_ampl_y'] = np.sqrt(nargs['gauss_noise_ampl_y']**2+gauss_noise_ampl_y**2)
-            nargs['gauss_noise_ampl_py'] = np.sqrt(nargs['gauss_noise_ampl_py']**2+gauss_noise_ampl_py**2)
-            nargs['gauss_noise_ampl_zeta'] = np.sqrt(nargs['gauss_noise_ampl_zeta']**2+gauss_noise_ampl_zeta**2)
-            nargs['gauss_noise_ampl_delta'] = np.sqrt(nargs['gauss_noise_ampl_delta']**2+gauss_noise_ampl_delta**2)
-
-        super().__init__(**nargs)
-
-    @property
-    def Q_s(self):
-        return np.arccos(self.cos_s) / (2*np.pi)
-
-    @property
-    def beta_x_1(self):
-        return self.beta_prod_x*self.beta_ratio_x
-
-    @property
-    def beta_y_1(self):
-        return self.beta_prod_y*self.beta_ratio_y
+        raise NotImplementedError(
+            '`LinearTransferMatrix` is deprecated. Use `LineSegmentMap` instead.')
 
 
 def _angle_from_trig(cos=None, sin=None, tan=None):
@@ -2899,18 +2681,24 @@ def _unregister_if_preset(ref):
 
 
 def _get_expr(knob):
+    """Return an xdeps expression for `knob`, or, if unavailable, the value."""
     if knob is None:
         return 0
     if hasattr(knob, '_expr'):
-        if knob._expr is None:
-            value = knob._get_value()
-            if hasattr(value, 'get'): # For pyopencl scalars
-                value = value.get()
-            return value
-        return knob._expr
+        if knob._expr is not None:
+            return knob._expr
+
+        value = knob._get_value()
+        if hasattr(value, 'get'):  # On cupy, pyopencl gets ndarray
+            value = value.get()
+        if hasattr(value, 'item'):  # Extract the scalar
+            value = value.item()
+        return value
     if isinstance(knob, Number):
         return knob
-    if hasattr(knob, 'dtype'): # it's an array
+    if hasattr(knob, 'dtype'):
+        if hasattr(knob, 'get'):
+            return knob.get()
         return knob
     raise ValueError(f'Cannot get expression for {knob}.')
 
@@ -2927,3 +2715,156 @@ def _get_order(array):
     if not np.any(nonzero_indices):
         return 0
     return np.max(nonzero_indices)
+
+class SecondOrderTaylorMap(BeamElement):
+
+    '''
+    Implements the second order Taylor map:
+
+       z_out[i] = k[i] + sum_j (R[i,j]*z_in[j]) + sum_jk (T[i,j,k]*z_in[j]*z_in[k])
+
+       where z = (x, px, y, py, zeta, pzeta)
+
+    Parameters
+    ----------
+    length : float
+        length of the element in meters.
+    k : array_like
+        6x1 array of the zero order Taylor map coefficients.
+    R : array_like
+        6x6 array of the first order Taylor map coefficients.
+    T : array_like
+        6x6x6 array of the second order Taylor map coefficients.
+
+    '''
+
+    isthick = True
+
+    _extra_c_sources = [
+        _pkg_root.joinpath('beam_elements/elements_src/second_order_taylor_map.h')]
+
+    _xofields={
+        'k': xo.Float64[6],
+        'R': xo.Float64[6,6],
+        'T': xo.Float64[6,6,6],
+        'length': xo.Float64
+    }
+
+    @classmethod
+    def from_line(cls, line, start, end, twiss_table=None,
+                  **kwargs):
+
+        '''
+        Generate a `SecondOrderTaylorMap` from a `Line` object.
+        The coefficients are computed with finite differences around the closed
+        orbit.
+
+        Parameters
+        ----------
+        line : Line
+            A `Line` object.
+        start : str
+            Name of the element where the map starts.
+        end : str
+            Name of the element where the map stops.
+        twiss_table : TwissTable, optional
+            A `TwissTable` object. If not given, it will be computed.
+
+        Returns
+        -------
+        SecondOrderTaylorMap
+            A `SecondOrderTaylorMap` object.
+
+        '''
+
+        if twiss_table is None:
+            tw = line.twiss(reverse=False)
+        else:
+            tw = twiss_table
+
+        twinit = tw.get_twiss_init(start)
+        twinit_out = tw.get_twiss_init(end)
+
+        RR = line.compute_one_turn_matrix_finite_differences(
+            start=start, end=end, particle_on_co=twinit.particle_on_co
+            )['R_matrix']
+        TT = line.compute_T_matrix(start=start, end=end,
+                                    particle_on_co=twinit.particle_on_co)
+
+        x_co_in = np.array([
+            twinit.particle_on_co.x[0],
+            twinit.particle_on_co.px[0],
+            twinit.particle_on_co.y[0],
+            twinit.particle_on_co.py[0],
+            twinit.particle_on_co.zeta[0],
+            twinit.particle_on_co.pzeta[0],
+        ])
+
+        x_co_out = np.array([
+            twinit_out.particle_on_co.x[0],
+            twinit_out.particle_on_co.px[0],
+            twinit_out.particle_on_co.y[0],
+            twinit_out.particle_on_co.py[0],
+            twinit_out.particle_on_co.zeta[0],
+            twinit_out.particle_on_co.pzeta[0],
+        ])
+
+        # Handle feeddown (express the expansion in z instead of z - z_co)
+        R_T_fd = np.einsum('ijk,k->ij', TT, x_co_in)
+        K_T_fd = R_T_fd @ x_co_in
+
+        K_hat = x_co_out - RR @ x_co_in + K_T_fd
+        RR_hat = RR - 2 * R_T_fd
+
+        smap = cls(R=RR_hat, T=TT, k=K_hat,
+                   length=tw['s', end] - tw['s', start],
+                   **kwargs)
+
+        return smap
+
+    def scale_coordinates(self, scale_x=1, scale_px=1, scale_y=1, scale_py=1,
+                          scale_zeta=1, scale_pzeta=1):
+
+        '''
+        Generate a new `SecondOrderTaylorMap` with scaled coordinates.
+
+        Parameters
+        ----------
+        scale_x : float
+            Scaling factor for x.
+        scale_px : float
+            Scaling factor for px.
+        scale_y : float
+            Scaling factor for y.
+        scale_py : float
+            Scaling factor for py.
+        scale_zeta : float
+            Scaling factor for zeta.
+        scale_pzeta : float
+            Scaling factor for pzeta.
+
+        Returns
+        -------
+        SecondOrderTaylorMap
+            A new `SecondOrderTaylorMap` with scaled coordinates.
+
+        '''
+
+        out = self.copy()
+
+        scale_factors = np.array(
+            [scale_x, scale_px, scale_y, scale_py, scale_zeta, scale_pzeta])
+
+        for ii in range(6):
+            out.T[ii, :, :] *= scale_factors[ii]
+            out.R[ii, :] *= scale_factors[ii]
+            out.k[ii] *= scale_factors[ii]
+
+        for jj in range(6):
+            out.T[:, jj, :] *= scale_factors[jj]
+            out.R[:, jj] *= scale_factors[jj]
+
+        for kk in range(6):
+            out.T[:, :, kk] *= scale_factors[kk]
+
+        return out

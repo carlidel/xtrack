@@ -87,20 +87,43 @@ void add_dispersion(
 }
 
 /*gpufun*/
-void transverse_motion(LocalParticle *part0,
-    double const qx, double const qy,
-    double const dqx, double const dqy,
-    double const detx_x, double const detx_y, double const dety_x, double const dety_y,
-    double const alfx_0, double const betx_0, double const alfy_0, double const bety_0,
-    double const alfx_1, double const betx_1, double const alfy_1, double const bety_1){
+void transverse_motion(LocalParticle *part0, LineSegmentMapData el){
+
+    double const qx = LineSegmentMapData_get_qx(el);
+    double const qy = LineSegmentMapData_get_qy(el);
+    double const det_xx = LineSegmentMapData_get_det_xx(el);
+    double const det_xy = LineSegmentMapData_get_det_xy(el);
+    double const det_yx = LineSegmentMapData_get_det_yx(el);
+    double const det_yy = LineSegmentMapData_get_det_yy(el);
+    double const alfx_0 = LineSegmentMapData_get_alfx(el, 0);
+    double const betx_0 = LineSegmentMapData_get_betx(el, 0);
+    double const alfy_0 = LineSegmentMapData_get_alfy(el, 0);
+    double const bety_0 = LineSegmentMapData_get_bety(el, 0);
+    double const alfx_1 = LineSegmentMapData_get_alfx(el, 1);
+    double const betx_1 = LineSegmentMapData_get_betx(el, 1);
+    double const alfy_1 = LineSegmentMapData_get_alfy(el, 1);
+    double const bety_1 = LineSegmentMapData_get_bety(el, 1);
+    int64_t const ndqx = LineSegmentMapData_len_coeffs_dqx(el);
+    int64_t const ndqy = LineSegmentMapData_len_coeffs_dqy(el);
 
     int64_t detuning;
     double sin_x = 0;
     double cos_x = 0;
     double sin_y = 0;
     double cos_y = 0;
-    if (dqx != 0.0 || dqy != 0.0 ||
-        detx_x != 0.0 || detx_y != 0.0 || dety_x != 0.0 || dety_y != 0.0){
+
+    int64_t any_chroma = 0;
+
+    for (int i_dqx=0; i_dqx<ndqx; i_dqx++){
+        any_chroma = LineSegmentMapData_get_coeffs_dqx(el, 0) != 0;
+    }
+
+    for (int i_dqy=0; i_dqy<ndqy; i_dqy++){
+        any_chroma = LineSegmentMapData_get_coeffs_dqy(el, 0) != 0;
+    }
+
+    if (any_chroma ||
+        det_xx != 0.0 || det_xy != 0.0 || det_yx != 0.0 || det_yy != 0.0){
         detuning = 1;
     }
     else{
@@ -134,12 +157,20 @@ void transverse_motion(LocalParticle *part0,
                     * LocalParticle_get_y(part)*LocalParticle_get_py(part)
                 + bety_0
                     * LocalParticle_get_py(part)*LocalParticle_get_py(part));
-            double phase = 2*PI*(qx + dqx * LocalParticle_get_delta(part)
-                                +detx_x * J_x + detx_y * J_y);
+            double phase = 2*PI*(qx + det_xx * J_x + det_xy * J_y);
+            for (int i_dqx=1; i_dqx<ndqx; i_dqx++){
+                phase += 2*PI*(LineSegmentMapData_get_coeffs_dqx(el, i_dqx) *
+                               pow(LocalParticle_get_delta(part), i_dqx));
+            }
+
             cos_x = cos(phase);
             sin_x = sin(phase);
-            phase = 2*PI*(qy + dqy * LocalParticle_get_delta(part)
-                            +dety_x * J_x + dety_y * J_y);
+            phase = 2*PI*(qy + det_yx * J_x + det_yy * J_y);
+            for (int i_dqy=1; i_dqy<ndqy; i_dqy++){
+                phase += 2*PI*(LineSegmentMapData_get_coeffs_dqy(el, i_dqy) *
+                               pow(LocalParticle_get_delta(part), i_dqy));
+            }
+
             cos_y = cos(phase);
             sin_y = sin(phase);
         }
@@ -304,6 +335,8 @@ void energy_and_reference_increments(LocalParticle *part0,
         // both the position and the momentum are scaled,
         // rather than only the momentum.
         if (energy_ref_increment != 0){
+            double const old_px = LocalParticle_get_px(part);
+            double const old_py = LocalParticle_get_py(part);
             double const new_energy0 = LocalParticle_get_mass0(part)
                 *LocalParticle_get_gamma0(part) + energy_ref_increment;
             double const new_p0c = sqrt(new_energy0*new_energy0
@@ -312,11 +345,11 @@ void energy_and_reference_increments(LocalParticle *part0,
             double const new_gamma0 = new_energy0 / LocalParticle_get_mass0(part);
             double const geo_emit_factor = sqrt(LocalParticle_get_beta0(part)
                     *LocalParticle_get_gamma0(part)/new_beta0/new_gamma0);
-            LocalParticle_update_p0c(part,new_p0c);
-            LocalParticle_scale_x(part,geo_emit_factor);
-            LocalParticle_scale_px(part,geo_emit_factor);
-            LocalParticle_scale_y(part,geo_emit_factor);
-            LocalParticle_scale_py(part,geo_emit_factor);
+            LocalParticle_update_p0c(part, new_p0c); // updates px, py but not in the smoothed way
+            LocalParticle_set_px(part, old_px * geo_emit_factor);
+            LocalParticle_set_py(part, old_py * geo_emit_factor);
+            LocalParticle_scale_x(part, geo_emit_factor);
+            LocalParticle_scale_y(part, geo_emit_factor);
         }
     //end_per_particle_block
 
@@ -353,7 +386,6 @@ void uncorrelated_gaussian_noise(LocalParticle *part0,
 /*gpufun*/
 void LineSegmentMap_track_local_particle(LineSegmentMapData el, LocalParticle* part0){
 
-
     remove_closed_orbit(part0,
         LineSegmentMapData_get_x_ref(el, 0),
         LineSegmentMapData_get_px_ref(el, 0),
@@ -366,23 +398,7 @@ void LineSegmentMap_track_local_particle(LineSegmentMapData el, LocalParticle* p
         LineSegmentMapData_get_dy(el, 0),
         LineSegmentMapData_get_dpy(el, 0));
 
-    transverse_motion(part0,
-        LineSegmentMapData_get_qx(el),
-        LineSegmentMapData_get_qy(el),
-        LineSegmentMapData_get_dqx(el),
-        LineSegmentMapData_get_dqy(el),
-        LineSegmentMapData_get_detx_x(el),
-        LineSegmentMapData_get_detx_y(el),
-        LineSegmentMapData_get_dety_x(el),
-        LineSegmentMapData_get_dety_y(el),
-        LineSegmentMapData_get_alfx(el, 0),
-        LineSegmentMapData_get_betx(el, 0),
-        LineSegmentMapData_get_alfy(el, 0),
-        LineSegmentMapData_get_bety(el, 0),
-        LineSegmentMapData_get_alfx(el, 1),
-        LineSegmentMapData_get_betx(el, 1),
-        LineSegmentMapData_get_alfy(el, 1),
-        LineSegmentMapData_get_bety(el, 1));
+    transverse_motion(part0, el);
 
     longitudinal_motion(part0, el);
 

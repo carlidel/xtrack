@@ -4,7 +4,6 @@ import numpy as np
 import pandas as pd
 
 import xtrack as xt
-import xpart as xp
 import xdeps as xd
 
 import matplotlib.pyplot as plt
@@ -48,7 +47,7 @@ for ii, tt in enumerate(t_test):
 
     qx.append(tw.qx)
     qy.append(tw.qy)
-    bety_at_qde3.append(tw['bety', 'br.qde3'])
+    bety_at_qde3.append(tw['bety', 'br.qde3_entry'])
     k0_bsw1.append(line['bi1.bsw1l1.1'].k0)
     k2l_bsw1.append(line['bi1.bsw1l1.1'].knl[2])
     k0_bsw2.append(line['bi1.bsw1l1.2'].k0)
