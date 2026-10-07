@@ -96,6 +96,11 @@ def build_ghost_particles(particles, n_ghosts=4, displacement=1e-8,
         if isinstance(vv, np.ndarray) and vv.shape == (n_ref,):
             dct[kk] = vv[idx].copy()
 
+    # The pdg ids (already integers) are written after construction:
+    # Particles resolves an array of pdg ids element by element, which would
+    # dominate the setup time
+    pdg_id = np.asarray(dct.pop('pdg_id'), dtype=np.int64)
+
     dct['particle_id'] = np.arange(n_tot, dtype=np.int64)
     dct['parent_particle_id'] = idx.astype(np.int64)
 
@@ -109,6 +114,7 @@ def build_ghost_particles(particles, n_ghosts=4, displacement=1e-8,
             dct.pop(kk, None)
 
     out = Particles.from_dict(dct, load_rng_state=False, _context=_context)
+    out.pdg_id[:] = _context.nparray_to_context_array(pdg_id)
     layout = GhostLayout(n_ref=n_ref, n_ghosts=n_ghosts,
                          reference_particle_id=reference_particle_id)
     return out, layout

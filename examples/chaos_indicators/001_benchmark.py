@@ -1,9 +1,9 @@
 """Cost of the chaos indicators compared with plain tracking.
 
 Two regimes:
-- Henon map: one cheap element per turn, so the cost of the ghosts, of the
-  pair kernels and of the Python loop over renormalisation chunks is
-  exposed;
+- Henon map: one very cheap element per turn (~18 ns per particle-turn),
+  so the per-orbit work of the pair kernels and of the tune monitor and the
+  Python cost of one tracking call per renormalisation chunk are exposed;
 - HL-LHC (test_data/hllhc15_noerrors_nobb): ~23500 elements per turn,
   tracking dominates.
 

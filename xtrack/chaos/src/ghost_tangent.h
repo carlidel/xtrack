@@ -22,35 +22,44 @@
 #define GHOST_TANGENT_MAX_DIM 6
 
 
-// Phase-space coordinate k of a slot: x, px, y, py, zeta, pzeta
+// Load the first dim phase-space coordinates of a slot: x, px, y, py, zeta,
+// pzeta (straight-line reads, no per-coordinate branching)
 GPUFUN
-double GhostTangent_get_coord(ParticlesData particles, int64_t slot, int64_t k)
+void GhostTangent_load(ParticlesData particles, int64_t slot, int64_t dim,
+                       double* zz)
 {
-    if (k == 0) return ParticlesData_get_x(particles, slot);
-    if (k == 1) return ParticlesData_get_px(particles, slot);
-    if (k == 2) return ParticlesData_get_y(particles, slot);
-    if (k == 3) return ParticlesData_get_py(particles, slot);
-    if (k == 4) return ParticlesData_get_zeta(particles, slot);
-    return ParticlesData_get_pzeta(particles, slot);
+    zz[0] = ParticlesData_get_x(particles, slot);
+    zz[1] = ParticlesData_get_px(particles, slot);
+    if (dim > 2){
+        zz[2] = ParticlesData_get_y(particles, slot);
+        zz[3] = ParticlesData_get_py(particles, slot);
+    }
+    if (dim > 4){
+        zz[4] = ParticlesData_get_zeta(particles, slot);
+        zz[5] = ParticlesData_get_pzeta(particles, slot);
+    }
 }
 
 
-// Write coordinate k; pzeta updates delta, rpp and rvv consistently (as
-// LocalParticle_update_pzeta)
+// Store the first dim coordinates of a slot; pzeta updates delta, rpp and
+// rvv consistently (as LocalParticle_update_pzeta)
 GPUFUN
-void GhostTangent_set_coord(ParticlesData particles, int64_t slot, int64_t k,
-                            double value)
+void GhostTangent_store(ParticlesData particles, int64_t slot, int64_t dim,
+                        const double* zz)
 {
-    if (k == 0) ParticlesData_set_x(particles, slot, value);
-    else if (k == 1) ParticlesData_set_px(particles, slot, value);
-    else if (k == 2) ParticlesData_set_y(particles, slot, value);
-    else if (k == 3) ParticlesData_set_py(particles, slot, value);
-    else if (k == 4) ParticlesData_set_zeta(particles, slot, value);
-    else {
+    ParticlesData_set_x(particles, slot, zz[0]);
+    ParticlesData_set_px(particles, slot, zz[1]);
+    if (dim > 2){
+        ParticlesData_set_y(particles, slot, zz[2]);
+        ParticlesData_set_py(particles, slot, zz[3]);
+    }
+    if (dim > 4){
+        double const pzeta = zz[5];
         double const beta0 = ParticlesData_get_beta0(particles, slot);
-        double const ptau = value * beta0;
-        double const irpp = sqrt(ptau * ptau + 2.0 * value + 1.0);
-        ParticlesData_set_pzeta(particles, slot, value);
+        double const ptau = pzeta * beta0;
+        double const irpp = sqrt(ptau * ptau + 2.0 * pzeta + 1.0);
+        ParticlesData_set_zeta(particles, slot, zz[4]);
+        ParticlesData_set_pzeta(particles, slot, pzeta);
         ParticlesData_set_delta(particles, slot, irpp - 1.0);
         ParticlesData_set_rpp(particles, slot, 1.0 / irpp);
         ParticlesData_set_rvv(particles, slot, irpp / (1.0 + beta0 * ptau));
@@ -58,16 +67,39 @@ void GhostTangent_set_coord(ParticlesData particles, int64_t slot, int64_t k,
 }
 
 
-// Euclidean norm of metric * vec (metric is dim x dim, row major)
+// Copy the metric to a local array; returns 1 if it is the identity
 GPUFUN
-double GhostTangent_apply_metric(GhostTangentData state, int64_t dim,
-                                 const double* vec, double* out)
+int64_t GhostTangent_read_metric(GhostTangentData state, int64_t dim,
+                                 double* metric)
+{
+    int64_t identity = 1;
+    for (int64_t kk = 0; kk < dim; kk++){
+        for (int64_t ll = 0; ll < dim; ll++){
+            double const mm = GhostTangentData_get_metric(state, kk * dim + ll);
+            metric[kk * dim + ll] = mm;
+            if (mm != (kk == ll ? 1.0 : 0.0)) identity = 0;
+        }
+    }
+    return identity;
+}
+
+
+// out = metric * vec (metric is dim x dim, row major); returns |out|
+GPUFUN
+double GhostTangent_apply_metric(const double* metric, int64_t identity,
+                                 int64_t dim, const double* vec, double* out)
 {
     double norm2 = 0;
     for (int64_t kk = 0; kk < dim; kk++){
-        double acc = 0;
-        for (int64_t ll = 0; ll < dim; ll++){
-            acc += GhostTangentData_get_metric(state, kk * dim + ll) * vec[ll];
+        double acc;
+        if (identity){
+            acc = vec[kk];
+        }
+        else{
+            acc = 0;
+            for (int64_t ll = 0; ll < dim; ll++){
+                acc += metric[kk * dim + ll] * vec[ll];
+            }
         }
         out[kk] = acc;
         norm2 += acc * acc;
@@ -93,21 +125,25 @@ void GhostTangent_build_slot_map(
 }
 
 
-GPUKERN
-void GhostTangent_renormalise(
+// Renormalisation of the ghosts of reference ii. Called with a literal dim
+// (2, 4 or 6) so that the loops over coordinates are specialised.
+GPUFUN
+void GhostTangent_renormalise_orbit(
     GhostTangentData state,
     ParticlesData particles,
-    GPUGLMEM double* weights,  // [n_chunks, n_samples], row major
-    int64_t chunk_index,
-    int64_t flag_gali,
-    int64_t n_ref)
+    GPUGLMEM double* weights,
+    int64_t const chunk_index,
+    int64_t const flag_gali,
+    int64_t const n_ref,
+    int64_t const ii,
+    int64_t const dim,
+    int64_t const n_ghosts,
+    int64_t const n_samples,
+    double const eps,
+    const double* metric,
+    int64_t const identity)
 {
-    int64_t const n_ghosts = GhostTangentData_get_n_ghosts(state);
-    int64_t const dim = GhostTangentData_get_dim(state);
-    int64_t const n_samples = GhostTangentData_get_n_samples(state);
-    double const eps = GhostTangentData_get_eps(state);
 
-    VECTORIZE_OVER(ii, n_ref);
 
     if (GhostTangentData_get_valid(state, ii)){
 
@@ -136,17 +172,16 @@ void GhostTangent_renormalise(
         }
 
         if (lost_turn < 0){
-            for (int64_t kk = 0; kk < dim; kk++){
-                ref[kk] = GhostTangent_get_coord(particles, slot_ref, kk);
-            }
+            GhostTangent_load(particles, slot_ref, dim, ref);
             for (int64_t gg = 0; gg < n_ghosts; gg++){
                 int64_t const slot_g = GhostTangentData_get_slot_of_id(
                     state, n_ref + ii * n_ghosts + gg);
+                GhostTangent_load(particles, slot_g, dim, dphys[gg]);
                 for (int64_t kk = 0; kk < dim; kk++){
-                    dphys[gg][kk] = GhostTangent_get_coord(particles, slot_g, kk)
-                                    - ref[kk];
+                    dphys[gg][kk] -= ref[kk];
                 }
-                rr[gg] = GhostTangent_apply_metric(state, dim, dphys[gg], unit[gg]);
+                rr[gg] = GhostTangent_apply_metric(metric, identity, dim,
+                                                   dphys[gg], unit[gg]);
                 // Also catches NaN and overflow
                 if (!(rr[gg] > 0.0 && rr[gg] < 1e300)){
                     lost_turn = ParticlesData_get_at_turn(particles, slot_ref);
@@ -159,9 +194,12 @@ void GhostTangent_renormalise(
             GhostTangentData_set_lost_at_turn(state, ii, lost_turn);
         }
         else{
-            // Stretching
+            // Stretching (one log per ghost; ghost 0 also feeds the
+            // Birkhoff FLI)
+            double lg0 = 0;
             for (int64_t gg = 0; gg < n_ghosts; gg++){
                 double const lg = log(rr[gg] / eps);
+                if (gg == 0) lg0 = lg;
                 int64_t const idx = ii * n_ghosts + gg;
                 GhostTangentData_set_log_growth(state, idx,
                     GhostTangentData_get_log_growth(state, idx) + lg);
@@ -169,7 +207,6 @@ void GhostTangent_renormalise(
                     unit[gg][kk] /= rr[gg];
                 }
             }
-            double const lg0 = log(rr[0] / eps);
             for (int64_t ss = 0; ss < n_samples; ss++){
                 double const ww = weights[chunk_index * n_samples + ss];
                 int64_t const idx = ii * n_samples + ss;
@@ -228,14 +265,60 @@ void GhostTangent_renormalise(
                 int64_t const slot_g = GhostTangentData_get_slot_of_id(
                     state, n_ref + ii * n_ghosts + gg);
                 double const scale = eps / rr[gg];
+                double zz[GHOST_TANGENT_MAX_DIM] = {0, 0, 0, 0, 0, 0};
                 for (int64_t kk = 0; kk < dim; kk++){
-                    GhostTangent_set_coord(particles, slot_g, kk,
-                                           ref[kk] + scale * dphys[gg][kk]);
+                    zz[kk] = ref[kk] + scale * dphys[gg][kk];
                 }
+                GhostTangent_store(particles, slot_g, dim, zz);
             }
         }
     }
 
+}
+
+
+GPUKERN
+void GhostTangent_renormalise(
+    GhostTangentData state,
+    ParticlesData particles,
+    GPUGLMEM double* weights,  // [n_chunks, n_samples], row major
+    int64_t chunk_index,
+    int64_t flag_gali,
+    int64_t n_ref)
+{
+    int64_t const n_ghosts = GhostTangentData_get_n_ghosts(state);
+    int64_t const dim = GhostTangentData_get_dim(state);
+    int64_t const n_samples = GhostTangentData_get_n_samples(state);
+    double const eps = GhostTangentData_get_eps(state);
+    double metric[GHOST_TANGENT_MAX_DIM * GHOST_TANGENT_MAX_DIM];
+    int64_t const identity = GhostTangent_read_metric(state, dim, metric);
+
+    VECTORIZE_OVER(ii, n_ref);
+        if (dim == 4 && n_ghosts == 1){
+            GhostTangent_renormalise_orbit(state, particles, weights,
+                chunk_index, flag_gali, n_ref, ii, 4, 1, n_samples,
+                eps, metric, identity);
+        }
+        else if (dim == 4 && n_ghosts == 4){
+            GhostTangent_renormalise_orbit(state, particles, weights,
+                chunk_index, flag_gali, n_ref, ii, 4, 4, n_samples,
+                eps, metric, identity);
+        }
+        else if (dim == 4){
+            GhostTangent_renormalise_orbit(state, particles, weights,
+                chunk_index, flag_gali, n_ref, ii, 4, n_ghosts, n_samples,
+                eps, metric, identity);
+        }
+        else if (dim == 2){
+            GhostTangent_renormalise_orbit(state, particles, weights,
+                chunk_index, flag_gali, n_ref, ii, 2, n_ghosts, n_samples,
+                eps, metric, identity);
+        }
+        else{
+            GhostTangent_renormalise_orbit(state, particles, weights,
+                chunk_index, flag_gali, n_ref, ii, 6, n_ghosts, n_samples,
+                eps, metric, identity);
+        }
     END_VECTORIZE;
 }
 
@@ -252,6 +335,8 @@ void GhostTangent_distance(
     int64_t n_slots)
 {
     int64_t const dim = GhostTangentData_get_dim(state);
+    double metric[GHOST_TANGENT_MAX_DIM * GHOST_TANGENT_MAX_DIM];
+    int64_t const identity = GhostTangent_read_metric(state, dim, metric);
 
     VECTORIZE_OVER(slot, n_slots);
         int64_t const pid = ParticlesData_get_particle_id(particles, slot);
@@ -262,11 +347,11 @@ void GhostTangent_distance(
             else{
                 double dd[GHOST_TANGENT_MAX_DIM];
                 double nn[GHOST_TANGENT_MAX_DIM];
+                GhostTangent_load(particles, slot, dim, dd);
                 for (int64_t kk = 0; kk < dim; kk++){
-                    dd[kk] = GhostTangent_get_coord(particles, slot, kk)
-                             - coords0[pid * dim + kk];
+                    dd[kk] -= coords0[pid * dim + kk];
                 }
-                out[pid] = GhostTangent_apply_metric(state, dim, dd, nn);
+                out[pid] = GhostTangent_apply_metric(metric, identity, dim, dd, nn);
             }
         }
     END_VECTORIZE;

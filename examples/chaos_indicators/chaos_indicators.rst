@@ -197,35 +197,46 @@ Performance
 ===========
 
 See ``examples/chaos_indicators/001_benchmark.py``. Cost relative to plain
-tracking, for the same horizon ``n``:
+tracking of the references, for the same horizon ``n``:
 
 * ghosts multiply the tracked particles by ``1 + n_ghosts`` (2 for FLI only,
   5 for SALI/GALI with 4 ghosts);
-* each renormalisation chunk is a separate tracking call plus two small
-  kernels; for cheap one-turn maps this per-call overhead dominates, so use
-  ``renorm_every > 1`` where possible (in the tangent-map limit FLI and the
-  SALI/GALI directions do not depend on it, the Birkhoff FLI becomes
-  chunk-averaged; with ghosts the separation must stay small between
-  renormalisations, i.e. ``eps * exp(l1 * renorm_every) << |z|``);
+* after each renormalisation chunk the pair kernels do per-orbit work:
+  about 26 ns per orbit with one ghost and 140 ns with four ghosts (4D,
+  serial CPU; most of it is the Gram-Schmidt of GALI), plus ~140 us of
+  Python per ``line.track`` call and ~60 us of kernel-call handling;
 * REM tracks ``2 n`` turns;
-* FMA with the in-line monitor adds a negligible per-turn cost on a lattice.
+* the in-line tune monitor costs a 4x4 normalisation and two ``atan2`` per
+  particle and turn;
+* NAFF runs ``nafflib`` on the host, four calls per particle.
 
-Measured on 4 CPU cores (time relative to plain tracking of the references
-for the same number of turns, serial / OpenMP):
+Measured on 4 CPU cores (time relative to plain tracking, serial / OpenMP):
 
 ========================================  ===============  ==================
 Indicator                                 Hénon map        HL-LHC (23.5k el.)
 ========================================  ===============  ==================
-FLI (1 ghost, renormalised every turn)    8.3 / 8.0        1.9 / 1.5
-FLI + SALI + GALI (4 ghosts, every turn)  22 / 19          4.5 / 3.1
-FLI + SALI + GALI (4 ghosts, every 10)    7.0 / 6.7        4.5 / 3.0
-REM(n)                                    2.5 / 2.3        1.9 / 1.8
-FMA, Birkhoff, in-line monitor            5.4 / 4.7        0.97 / 0.96
-FMA, NAFF on the host                     138 / 283        1.0 / 1.0
-All of the above (compute_indicators)     32 / 36          6.1 / 4.7
+FLI (1 ghost, renormalised every turn)    4.9 / 10         1.9 / 1.5
+FLI + SALI + GALI (4 ghosts, every turn)  18 / 27          4.5 / 3.1
+FLI + SALI + GALI (4 ghosts, every 10)    6.5 / 9.8        4.5 / 3.0
+REM(n)                                    2.3 / 3.8        1.9 / 1.8
+FMA, Birkhoff, in-line monitor            7.3 / 7.0        0.97 / 0.96
+FMA, NAFF on the host                     155 / 450        1.0 / 1.0
+All of the above (compute_indicators)     30 / 53          6.1 / 4.7
 ========================================  ===============  ==================
 
-On a cheap one-turn map the fixed costs dominate (one tracking call and two
-small kernels per renormalisation, the atan2 of the tune monitor, NAFF on
-the host); on a realistic lattice the cost is set by the number of tracked
-particles (``1 + n_ghosts``) and turns (``2 n`` for REM).
+The large factors on the Hénon map come from its very cheap turn (about
+18 ns per particle serially, 5 ns with OpenMP): any bookkeeping per orbit
+and turn is comparable to several turns of the map. For FLI with one ghost
+(0.86 s for 10,000 orbits and 1000 turns, serial) the time splits into
+tracking twice as many particles (~0.35 s), the renormalisation kernel
+(~0.26 s), Python per tracking call (~0.14 s), the slot map and kernel-call
+handling (~0.06 s) and the one-off ghost setup (~0.04 s). OpenMP factors on
+the Hénon map are noisy because the baseline is only 50-80 ms. Use
+``renorm_every > 1`` to amortise the per-chunk work (in the tangent-map
+limit FLI and the SALI/GALI directions do not depend on it, the Birkhoff FLI
+becomes chunk-averaged; with ghosts the separation must stay small between
+renormalisations, i.e. ``eps * exp(l1 * renorm_every) << |z|``).
+
+On a realistic lattice a particle-turn costs about 1 ms, so all of the
+above is negligible: the cost is set by the number of tracked particles
+(``1 + n_ghosts``) and turns (``2 n`` for REM), and FMA is free.
