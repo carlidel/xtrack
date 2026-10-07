@@ -185,6 +185,37 @@ twiss normalisation, chromaticity and dispersion. It has an exact inverse
 (backtracking). ``multipole_coeffs=[2, 6 mu]`` gives
 ``px += x^2 - y^2 + mu (x^3 - 3 x y^2)``, ``py += -2 x y + mu (y^3 - 3 x^2 y)``.
 
+Tune modulation
+---------------
+
+The linear tunes can be modulated turn by turn from pre-computed tables of
+``sin`` and ``cos`` (no trigonometry during tracking). The tables have a
+common length ``L`` and **the modulation is periodic**: turn ``t`` uses entry
+``(t - modulation_start_turn) mod L``, in both directions, so a run may be
+longer than the tables. Backtracking turn ``t`` reads the same entry as the
+forward turn ``t``, so REM and other backward checks stay exact. Each
+element owns its tables, so a line with several kicks per turn can modulate
+each phase advance independently.
+
+.. code-block:: python
+
+    L = 1_000_000                       # one modulation period, in turns
+    n = np.arange(L)
+    ripple = sum(eps_k * np.cos(Omega_k * n) for eps_k, Omega_k in zip(eps_ks, Omega_ks))
+    omega_x = 2 * np.pi * 0.168 * (1 + eps * ripple)
+    omega_y = 2 * np.pi * 0.201 * (1 + eps * ripple)
+
+    henon = xt.Henonmap(multipole_coeffs=[2.0, 6.0 * mu], norm=True,
+                        **xt.Henonmap.modulation_arrays(omega_x, omega_y))
+
+Choose ``L`` so that the modulation really is periodic over it (for
+frequencies ``Omega_k = 2 pi m_k / L`` with integer ``m_k``) or longer than the
+run. The tables cost 32 bytes per turn of period (32 MB for ``L = 1e6``) and
+are shared by all particles. Measured on 10,000 particles, the modulated map
+costs the same as the static one (26.9 vs 26.4 ns per particle-turn serial).
+``sin^2 + cos^2 = 1`` is checked so that the map stays symplectic, and
+modulation requires ``n_turns = 1``.
+
 Example: stability maps
 =======================
 

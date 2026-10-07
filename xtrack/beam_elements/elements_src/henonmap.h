@@ -63,6 +63,8 @@ void Henonmap_track_local_particle(HenonmapData el, LocalParticle* part0){
     double const ddx = HenonmapData_get_ddx(el);
 
     int64_t const norm = HenonmapData_get_norm(el);
+    int64_t const mod_period = HenonmapData_get_modulation_period(el);
+    int64_t const mod_start = HenonmapData_get_modulation_start_turn(el);
 
     int const backtrack = LocalParticle_check_track_flag(part0, XS_FLAG_BACKTRACK);
 
@@ -109,21 +111,37 @@ void Henonmap_track_local_particle(HenonmapData el, LocalParticle* part0){
         double const px_hat_f = alpha_x * dx * delta / sqrt_beta_x
                                 + ddx * delta * sqrt_beta_x;
 
-        double curr_cos_omega_x = cos_omega_x;
-        double curr_sin_omega_x = sin_omega_x;
-        double curr_cos_omega_y = cos_omega_y;
-        double curr_sin_omega_y = sin_omega_y;
+        // Linear tunes of this turn: static, or from the periodic
+        // modulation tables (index (at_turn - start) mod period, also in
+        // backtracking, where at_turn is decremented before the turn)
+        double base_cos_omega_x = cos_omega_x;
+        double base_sin_omega_x = sin_omega_x;
+        double base_cos_omega_y = cos_omega_y;
+        double base_sin_omega_y = sin_omega_y;
+        if (mod_period > 0){
+            int64_t idx = (LocalParticle_get_at_turn(part) - mod_start) % mod_period;
+            if (idx < 0) idx += mod_period;
+            base_sin_omega_x = HenonmapData_get_modulation_sin_omega_x(el, idx);
+            base_cos_omega_x = HenonmapData_get_modulation_cos_omega_x(el, idx);
+            base_sin_omega_y = HenonmapData_get_modulation_sin_omega_y(el, idx);
+            base_cos_omega_y = HenonmapData_get_modulation_cos_omega_y(el, idx);
+        }
+
+        double curr_cos_omega_x = base_cos_omega_x;
+        double curr_sin_omega_x = base_sin_omega_x;
+        double curr_cos_omega_y = base_cos_omega_y;
+        double curr_sin_omega_y = base_sin_omega_y;
         if (domegax != 0){
             double const cos_domega_x = cos(domegax * delta);
             double const sin_domega_x = sin(domegax * delta);
-            curr_cos_omega_x = cos_omega_x * cos_domega_x - sin_omega_x * sin_domega_x;
-            curr_sin_omega_x = sin_omega_x * cos_domega_x + cos_omega_x * sin_domega_x;
+            curr_cos_omega_x = base_cos_omega_x * cos_domega_x - base_sin_omega_x * sin_domega_x;
+            curr_sin_omega_x = base_sin_omega_x * cos_domega_x + base_cos_omega_x * sin_domega_x;
         }
         if (domegay != 0){
             double const cos_domega_y = cos(domegay * delta);
             double const sin_domega_y = sin(domegay * delta);
-            curr_cos_omega_y = cos_omega_y * cos_domega_y - sin_omega_y * sin_domega_y;
-            curr_sin_omega_y = sin_omega_y * cos_domega_y + cos_omega_y * sin_domega_y;
+            curr_cos_omega_y = base_cos_omega_y * cos_domega_y - base_sin_omega_y * sin_domega_y;
+            curr_sin_omega_y = base_sin_omega_y * cos_domega_y + base_cos_omega_y * sin_domega_y;
         }
 
         double const multipole_scale = 1.0 / (1.0 + delta);

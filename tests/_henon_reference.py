@@ -93,6 +93,27 @@ class HenonReference:
             state = stepper(state)
         return state
 
+    def track_modulated(self, state, turns, sin_x, cos_x, sin_y, cos_y,
+                        start_turn=0):
+        """Track through the given turn numbers with a periodic tune
+        modulation: turn t rotates by the angles of index
+        (t - start_turn) mod L of the tables."""
+        state = np.array(state, dtype=float)
+        period = len(sin_x)
+        for tt in turns:
+            ii = (tt - start_turn) % period
+            x, px, y, py = state
+            fx, fy = self.kick(x, y)
+            pxk = px + fx
+            pyk = py + fy
+            state = np.array([
+                cos_x[ii] * x + sin_x[ii] * pxk,
+                -sin_x[ii] * x + cos_x[ii] * pxk,
+                cos_y[ii] * y + sin_y[ii] * pyk,
+                -sin_y[ii] * y + cos_y[ii] * pyk,
+            ])
+        return state
+
     def trajectory(self, state, n_turns):
         """States at turns 0..n_turns, shape (n_turns + 1, 4, N)."""
         state = np.array(state, dtype=float)

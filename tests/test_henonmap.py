@@ -280,3 +280,143 @@ def test_henonmap_vs_numpy_reference(test_context):
     ref = HenonReference(omega_x, omega_y, coeffs)
     z_ref = ref.track(z0, 1000)
     xo.assert_allclose(sorted_coords(ctx, p), z_ref, rtol=0, atol=1e-11)
+
+
+# Tune modulation -----------------------------------------------------------
+
+def _ripple(n, omega0, eps):
+    # Two-line ripple, periodic by construction over n turns
+    t = np.arange(n)
+    return omega0 * (1 + eps * (np.cos(2 * np.pi * 3 * t / n)
+                                + 0.5 * np.cos(2 * np.pi * 7 * t / n)))
+
+
+def test_henonmap_modulation_validation():
+    mod = xt.Henonmap.modulation_arrays(_ripple(10, 1.0, 1e-3),
+                                        _ripple(10, 2.0, 1e-3))
+    henon = xt.Henonmap(multipole_coeffs=[2.0], norm=True,
+                        modulation_start_turn=4, **mod)
+    assert henon.modulation_period == 10
+    assert xt.Henonmap(multipole_coeffs=[2.0]).modulation_period == 0
+
+    henon2 = xt.Henonmap.from_dict(henon.to_dict())
+    assert henon2.modulation_period == 10 and henon2.modulation_start_turn == 4
+    for nn in xt.Henonmap._modulation_fields:
+        xo.assert_allclose(getattr(henon2, nn), mod[nn], rtol=0, atol=0)
+
+    bad = dict(mod)
+    bad['modulation_cos_omega_y'] = bad['modulation_cos_omega_y'][:9]
+    with pytest.raises(ValueError, match='same length'):
+        xt.Henonmap(**bad)
+    bad = dict(mod)
+    bad.pop('modulation_sin_omega_y')
+    with pytest.raises(ValueError, match='together'):
+        xt.Henonmap(**bad)
+    bad = dict(mod)
+    bad['modulation_sin_omega_x'] = 1.01 * bad['modulation_sin_omega_x']
+    with pytest.raises(ValueError, match='sin\\^2'):
+        xt.Henonmap(**bad)
+    with pytest.raises(ValueError, match='n_turns'):
+        xt.Henonmap(n_turns=2, **mod)
+
+
+@for_all_test_contexts
+@allow_kernel_compilation
+def test_henonmap_modulation_constant_equals_static(test_context):
+    omega_x, omega_y = 2 * np.pi * 0.168, 2 * np.pi * 0.201
+    henon = xt.Henonmap(omega_x=omega_x, omega_y=omega_y,
+                        multipole_coeffs=[2.0, -1.2], norm=True)
+    mod = xt.Henonmap.modulation_arrays(np.full(13, omega_x),
+                                        np.full(13, omega_y))
+    henon_mod = xt.Henonmap(multipole_coeffs=[2.0, -1.2], norm=True, **mod)
+    ctx, line = context_and_line(test_context, [henon])
+    _, line_mod = context_and_line(test_context, [henon_mod])
+
+    r = np.linspace(0.02, 0.3, 8)
+    p = xt.Particles(x=r, y=0.7 * r, _context=ctx)
+    p_mod = p.copy()
+    line.track(p, num_turns=200)
+    line_mod.track(p_mod, num_turns=200)
+    xo.assert_allclose(sorted_coords(ctx, p_mod), sorted_coords(ctx, p),
+                       rtol=0, atol=0)
+
+
+@for_all_test_contexts
+@allow_kernel_compilation
+def test_henonmap_modulation_vs_reference(test_context):
+    # Period of 37 turns, index 0 at turn 5: tracking 300 turns from turn 0
+    # wraps around many times and starts at a negative offset
+    period, start, num_turns = 37, 5, 300
+    om_x = _ripple(period, 2 * np.pi * 0.168, 2e-2)
+    om_y = _ripple(period, 2 * np.pi * 0.201, 2e-2)
+    mod = xt.Henonmap.modulation_arrays(om_x, om_y)
+    coeffs = [2.0, 6.0 * (-0.2)]
+    henon = xt.Henonmap(multipole_coeffs=coeffs, norm=True,
+                        modulation_start_turn=start, **mod)
+    ctx, line = context_and_line(test_context, [henon])
+
+    r = np.linspace(0.02, 0.2, 6)
+    z0 = np.array([r, 0 * r, 0.5 * r, 0 * r])
+    p = xt.Particles(_context=ctx, **dict(zip(('x', 'px', 'y', 'py'), z0)))
+    line.track(p, num_turns=num_turns)
+
+    ref = HenonReference(0, 0, coeffs)
+    z_ref = ref.track_modulated(
+        z0, range(num_turns), mod['modulation_sin_omega_x'],
+        mod['modulation_cos_omega_x'], mod['modulation_sin_omega_y'],
+        mod['modulation_cos_omega_y'], start_turn=start)
+    xo.assert_allclose(sorted_coords(ctx, p), z_ref, rtol=0, atol=1e-12)
+
+    # The modulation matters: same map without it differs
+    z_static = HenonReference(om_x[0], om_y[0], coeffs).track(z0, num_turns)
+    assert np.max(np.abs(z_static - z_ref)) > 1e-3
+
+    # Particles at different turns read different table entries
+    p2 = xt.Particles(_context=ctx, at_turn=[0, 40],
+                      **dict(zip(('x', 'px', 'y', 'py'), z0[:, :2])))
+    line.track(p2, num_turns=10)
+    expected = [ref.track_modulated(
+        z0[:, ii:ii + 1], range(t0, t0 + 10), mod['modulation_sin_omega_x'],
+        mod['modulation_cos_omega_x'], mod['modulation_sin_omega_y'],
+        mod['modulation_cos_omega_y'], start_turn=start)[:, 0]
+        for ii, t0 in enumerate((0, 40))]
+    xo.assert_allclose(sorted_coords(ctx, p2), np.array(expected).T,
+                       rtol=0, atol=1e-14)
+
+
+@for_all_test_contexts
+@allow_kernel_compilation
+def test_henonmap_modulation_backtrack(test_context):
+    # Physical coordinates, chromaticity and dispersion on top of the
+    # modulation; backtracking must use the same table entry as the
+    # forward turn
+    mod = xt.Henonmap.modulation_arrays(_ripple(23, 2 * np.pi * 0.168, 5e-2),
+                                        _ripple(23, 2 * np.pi * 0.201, 5e-2))
+    henon = xt.Henonmap(twiss_params=[0.5, 20., -0.3, 5.], dqx=2., dqy=-1.,
+                        dx=1.5, ddx=0.1, multipole_coeffs=[0.05, -0.01],
+                        norm=False, modulation_start_turn=3, **mod)
+    ctx, line = context_and_line(test_context, [henon])
+
+    rng = np.random.default_rng(4)
+    n_part = 20
+    p = xt.Particles(_context=ctx,
+                     x=rng.uniform(-1e-2, 1e-2, n_part),
+                     px=rng.uniform(-1e-3, 1e-3, n_part),
+                     y=rng.uniform(-1e-2, 1e-2, n_part),
+                     py=rng.uniform(-1e-3, 1e-3, n_part),
+                     delta=rng.uniform(-1e-3, 1e-3, n_part))
+    p0 = p.copy()
+    line.track(p, num_turns=100)
+    assert np.max(np.abs(sorted_coords(ctx, p) - sorted_coords(ctx, p0))) > 1e-3
+    line.track(p, num_turns=100, backtrack=True)
+    xo.assert_allclose(sorted_coords(ctx, p), sorted_coords(ctx, p0),
+                       rtol=0, atol=1e-12)
+    xo.assert_allclose(sorted_coords(ctx, p, ('at_turn',)),
+                       sorted_coords(ctx, p0, ('at_turn',)), rtol=0, atol=0)
+
+    # REM on the modulated map stays at round-off for a regular orbit
+    henon_n = xt.Henonmap(multipole_coeffs=[2.0], norm=True, **mod)
+    _, line_n = context_and_line(test_context, [henon_n])
+    res = xt.chaos.compute_rem(line_n, xt.Particles(_context=ctx, x=0.05, y=0.05),
+                               [500])
+    assert res.rem[0, 0] < 1e-12
