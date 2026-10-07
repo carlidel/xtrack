@@ -41,6 +41,7 @@ from .mad_loader import MadLoader
 from .multisetter import MultiSetter
 
 from .footprint import Footprint, LinearRescale
+from . import chaos
 from .integral_optimization import IntegralOptimization
 
 # Flags and test functions
