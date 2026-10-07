@@ -257,3 +257,89 @@ def test_tangent_indicators_losses(test_context):
     for name in ('valid', 'lost_at_turn', 'fli', 'fli_birkhoff', 'sali'):
         xo.assert_allclose(getattr(res_perm, name), getattr(res, name),
                            rtol=0, atol=0)
+
+
+# SALI and GALI -------------------------------------------------------------
+
+def _window_slope(n, values, edges):
+    """Slope of log(median of values) vs log(n) over windows (a, b]."""
+    n = np.asarray(n)
+    centres, medians = [], []
+    for aa, bb in zip(edges[:-1], edges[1:]):
+        sel = (n > aa) & (n <= bb)
+        centres.append(np.log(np.sqrt(aa * bb)))
+        medians.append(np.median(np.log(values[sel])))
+    return np.polyfit(centres, medians, 1)[0]
+
+
+@for_all_test_contexts
+@allow_kernel_compilation
+def test_sali_gali_regular_orbit(test_context):
+    # On a 2-torus of the 4D map: SALI and GALI_2 ~ constant,
+    # GALI_3 ~ n^-2, GALI_4 ~ n^-4. The power laws set in after a transient
+    # that grows as the amplitude-dependent detuning decreases; r = 0.25 is
+    # in the asymptotic regime from ~1e3 turns. Directions do not depend on
+    # the renormalisation period, so renorm_every=100 is exact here.
+    ctx, line = _henon_line(test_context)
+    z0 = _diagonal_orbits(0.25)
+    num_turns = 20_000
+    sample_turns = np.arange(100, num_turns + 1, 100)
+    res = xt.chaos.compute_tangent_indicators(
+        line, _particles(ctx, z0), num_turns, sample_turns, n_ghosts=4,
+        renorm_every=100)
+    ref = hr.tangent_indicators(hr.HenonReference(OMEGA_X, OMEGA_Y, COEFFS),
+                                z0, num_turns, sample_turns, renorm_every=100)
+    assert np.all(res.valid)
+    # Measured over 2e4 turns: 5e-4 (SALI, GALI_2), 1e-2 (GALI_3, GALI_4,
+    # values down to ~1e-9)
+    xo.assert_allclose(res.sali, ref['sali'], rtol=2e-3, atol=0)
+    xo.assert_allclose(res.gali[2], ref['gali'][:, :, 0], rtol=2e-3, atol=0)
+    for kk in (3, 4):
+        xo.assert_allclose(res.gali[kk], ref['gali'][:, :, kk - 2],
+                           rtol=3e-2, atol=0)
+
+    # SALI oscillates along the torus: fit the medians of octave windows.
+    # Measured: +0.09 (SALI, GALI_2), -1.74 (GALI_3), -3.91 (GALI_4).
+    edges = (1250, 2500, 5000, 10_000, 20_000)
+    assert np.min(res.sali) > 1e-2
+    assert abs(_window_slope(sample_turns, res.sali[:, 0], edges)) < 0.3
+    assert abs(_window_slope(sample_turns, res.gali[2][:, 0], edges)) < 0.3
+    assert -2.3 < _window_slope(sample_turns, res.gali[3][:, 0], edges) < -1.6
+    assert -4.5 < _window_slope(sample_turns, res.gali[4][:, 0], edges) < -3.5
+
+
+@for_all_test_contexts
+@allow_kernel_compilation
+def test_sali_gali_chaotic_orbit(test_context):
+    # For a 4D symplectic map the Lyapunov spectrum is (l1, l2, -l2, -l1):
+    # GALI_3 ~ exp(-2 l1 n) and GALI_4 ~ exp(-4 l1 n), with l1 the FLI slope.
+    ctx, line = _henon_line(test_context)
+    z0 = _diagonal_orbits(0.38)
+    sample_turns = np.arange(5, 1001, 5)
+    res = xt.chaos.compute_tangent_indicators(
+        line, _particles(ctx, z0), 1000, sample_turns, n_ghosts=4)
+    ref = hr.tangent_indicators(hr.HenonReference(OMEGA_X, OMEGA_Y, COEFFS),
+                                z0, 1000, sample_turns)
+    assert np.all(res.valid)
+
+    fit = (sample_turns >= 10) & (sample_turns <= 110)
+    lyap = np.polyfit(sample_turns[fit], res.fli[fit, 0], 1)[0]
+    assert lyap > 0.05
+    for kk, factor in ((3, 2), (4, 4)):
+        slope = np.polyfit(sample_turns[fit], np.log(res.gali[kk][fit, 0]), 1)[0]
+        assert 0.85 < slope / (-factor * lyap) < 1.15
+    sali_slope = np.polyfit(sample_turns[fit], np.log(res.sali[fit, 0]), 1)[0]
+    assert -1.2 * lyap < sali_slope < 0  # rate l1 - l2 <= l1
+    assert res.sali[-1, 0] < 1e-5
+
+    # Above the finite-difference floor the ghosts reproduce the tangent map
+    above = ref['gali'][:, 0, 2] > 1e-12
+    assert above.sum() >= 15
+    xo.assert_allclose(res.gali[4][above, 0], ref['gali'][above, 0, 2],
+                       rtol=0.1, atol=0)
+    # Floor: with eps = 1e-8 the ghost directions are resolved to
+    # ~1e-16 |z| / eps, so GALI_4 saturates (or drops to exactly 0 when two
+    # ghosts coincide) while the exact-tangent value keeps decreasing.
+    assert ref['gali'][-1, 0, 2] < 1e-35
+    late = res.gali[4][sample_turns >= 500, 0]
+    assert np.median(late[late > 0]) > 1e-26
