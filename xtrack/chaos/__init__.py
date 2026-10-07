@@ -11,9 +11,11 @@ kernels between tracking calls measure and renormalise their separations.
 
 from .ghosts import GhostLayout, build_ghost_particles, metric_from_twiss
 from .tangent import GhostTangent
+from .tune_monitor import BirkhoffTuneMonitor
 from .indicators import (
     ChaosIndicators,
     birkhoff_weights,
+    compute_fma,
     compute_rem,
     compute_tangent_indicators,
     renormalisation_turns,

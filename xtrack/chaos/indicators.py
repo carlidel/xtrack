@@ -303,3 +303,125 @@ def compute_rem(line, particles, rem_turns, metric=None, dim=4,
     res.rem = rem
     res.rem_valid = np.isfinite(rem)
     return res
+
+
+def _tune_monitor_names(line):
+    from .tune_monitor import BirkhoffTuneMonitor
+    return [nn for nn in line.element_names
+            if isinstance(line._element_dict[nn], BirkhoffTuneMonitor)]
+
+
+def _get_inline_tune_monitor(line, n_ref, window, start_turn):
+    names = _tune_monitor_names(line)
+    if len(names) == 0:
+        return None
+    if len(names) > 1:
+        raise ValueError(f'More than one BirkhoffTuneMonitor in the line: {names}')
+    mon = line._element_dict[names[0]]
+    if (mon.particle_id_start != 0 or mon.num_particles < n_ref
+            or mon.window != window or mon.start_turn != start_turn):
+        raise ValueError(
+            f'The BirkhoffTuneMonitor `{names[0]}` in the line must have '
+            f'particle_id_start=0, num_particles>={n_ref}, window={window} '
+            f'and start_turn={start_turn}')
+    return mon
+
+
+def compute_fma(line, particles, window, start_turn=0, metric=None,
+                closed_orbit=None, method='birkhoff', _result=None):
+    """Frequency map analysis: tunes in two consecutive windows and their
+    diffusion ``log10(sqrt(dqx^2 + dqy^2))``.
+
+    Parameters
+    ----------
+    line : xtrack.Line
+        Line with a tracker (one pass is one turn).
+    particles : xtrack.Particles
+        Reference particles (all alive). They are not modified.
+    window : int
+        Turns per window; ``start_turn + 2 window`` turns are tracked.
+    start_turn : int
+        Turn at which the first window starts.
+    metric, closed_orbit :
+        Normalisation ``z_n = metric (z - closed_orbit)`` of
+        ``(x, px, y, py)``; identity and zero by default (use
+        :func:`metric_from_twiss` and the twiss closed orbit for a lattice).
+    method : {'birkhoff', 'naff'}
+        ``'birkhoff'`` (default): Birkhoff-weighted phase advances
+        accumulated in a kernel by :class:`BirkhoffTuneMonitor`, on any
+        context. If the line contains a ``BirkhoffTuneMonitor`` (with
+        ``particle_id_start=0``, ``num_particles >= N`` and the same
+        `window` and `start_turn`) it is used and all turns are tracked in a
+        single call; otherwise a standalone monitor is applied between
+        one-turn tracking calls. ``'naff'``: turn-by-turn data and
+        ``nafflib.tune`` on the host (reference path; needs ``nafflib``).
+
+    Returns
+    -------
+    ChaosIndicators
+        With ``qx``, ``qy`` (first window), ``qx2``, ``qy2`` (second
+        window), ``tune_diffusion`` and ``fma_valid``; NaN for particles lost
+        before the end of the second window.
+    """
+    from .tune_monitor import BirkhoffTuneMonitor
+    _check_line(line)
+    context = line._context
+    window = int(window)
+    start_turn = int(start_turn)
+    if method not in ('birkhoff', 'naff'):
+        raise ValueError("`method` must be 'birkhoff' or 'naff'")
+
+    p_ref, layout = build_ghost_particles(particles, n_ghosts=0, _context=context)
+    n_ref = layout.n_ref
+    metric = np.eye(4) if metric is None else np.asarray(metric, dtype=float)
+    closed_orbit = (np.zeros(4) if closed_orbit is None
+                    else np.asarray(closed_orbit, dtype=float))
+
+    if method == 'birkhoff':
+        mon = _get_inline_tune_monitor(line, n_ref, window, start_turn)
+        if mon is not None:
+            mon.w_inv[:] = context.nparray_to_context_array(metric.ravel())
+            mon.closed_orbit[:] = context.nparray_to_context_array(closed_orbit)
+            mon.reset()
+            line.track(p_ref, num_turns=start_turn + 2 * window + 1)
+        else:
+            mon = BirkhoffTuneMonitor(
+                _context=context, num_particles=n_ref, window=window,
+                start_turn=start_turn, metric=metric, closed_orbit=closed_orbit)
+            if start_turn > 0:
+                line.track(p_ref, num_turns=start_turn)
+            for jj in range(2 * window + 1):
+                mon.track(p_ref)
+                if jj < 2 * window:
+                    line.track(p_ref, num_turns=1)
+        qx1, qy1, qx2, qy2, diffusion = (vv[:n_ref] for vv in mon.get_tunes())
+    else:
+        import nafflib
+        n_turns = start_turn + 2 * window
+        line.track(p_ref, num_turns=n_turns, turn_by_turn_monitor=True)
+        rec = line.record_last_track
+        coords = np.array([rec.x, rec.px, rec.y, rec.py])[:, :n_ref, :]
+        zn = np.einsum('kl,lpt->kpt', metric, coords - closed_orbit[:, None, None])
+        state = context.nparray_from_context_array(p_ref.state)
+        pid = context.nparray_from_context_array(p_ref.particle_id)
+        alive = np.zeros(n_ref, dtype=bool)
+        alive[pid[pid < n_ref]] = state[pid < n_ref] > 0
+        qq = np.full((4, n_ref), np.nan)
+        w1 = slice(start_turn, start_turn + window)
+        w2 = slice(start_turn + window, start_turn + 2 * window)
+        for ii in np.where(alive)[0]:
+            qq[0, ii] = nafflib.tune(zn[0, ii, w1], zn[1, ii, w1]) % 1
+            qq[1, ii] = nafflib.tune(zn[2, ii, w1], zn[3, ii, w1]) % 1
+            qq[2, ii] = nafflib.tune(zn[0, ii, w2], zn[1, ii, w2]) % 1
+            qq[3, ii] = nafflib.tune(zn[2, ii, w2], zn[3, ii, w2]) % 1
+        qx1, qy1, qx2, qy2 = qq
+        with np.errstate(divide='ignore', invalid='ignore'):
+            diffusion = np.log10(np.sqrt((qx1 - qx2)**2 + (qy1 - qy2)**2))
+
+    res = _result or ChaosIndicators(layout.reference_particle_id,
+                                     [start_turn + 2 * window])
+    res.qx, res.qy, res.qx2, res.qy2 = qx1, qy1, qx2, qy2
+    res.tune_diffusion = diffusion
+    res.fma_valid = np.isfinite(qx1)
+    res.fma_method = method
+    return res

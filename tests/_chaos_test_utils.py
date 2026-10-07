@@ -18,7 +18,8 @@ _SHARED = {}
 
 
 def _warmup_elements():
-    return [xt.Henonmap(), xt.LimitRect()]
+    return [xt.Henonmap(), xt.LimitRect(),
+            xt.chaos.BirkhoffTuneMonitor(num_particles=1, window=1)]
 
 
 def shared_context(test_context):

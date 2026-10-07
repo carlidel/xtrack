@@ -401,3 +401,69 @@ def test_rem_requires_backtrackable_line(test_context):
     line_ok.enable_time_dependent_vars = True
     with pytest.raises(ValueError, match='time-dependent'):
         xt.chaos.compute_rem(line_ok, p, 10)
+
+
+# FMA -----------------------------------------------------------------------
+
+@for_all_test_contexts
+@allow_kernel_compilation
+def test_fma_birkhoff_tune_monitor(test_context):
+    r = np.array([1e-3, 0.05, 0.1, 0.2, 0.34, 0.38, 0.5])
+    regular = r <= 0.2
+    chaotic = (r > 0.3) & (r < 0.45)
+    z0 = _diagonal_orbits(r)
+    window = 500
+
+    # In-line monitor at the start of the line: one tracking call
+    monitor = xt.chaos.BirkhoffTuneMonitor(num_particles=len(r), window=window)
+    henon = xt.Henonmap(omega_x=OMEGA_X, omega_y=OMEGA_Y,
+                        multipole_coeffs=COEFFS, norm=True)
+    aperture = xt.LimitRect(min_x=-1, max_x=1, min_y=-1, max_y=1)
+    ctx, line_mon = context_and_line(test_context, [monitor, henon, aperture])
+    res = xt.chaos.compute_fma(line_mon, _particles(ctx, z0), window)
+
+    # Standalone monitor between one-turn tracking calls: identical
+    _, line = _henon_line(test_context)
+    res_sa = xt.chaos.compute_fma(line, _particles(ctx, z0), window)
+    for name in ('qx', 'qy', 'qx2', 'qy2', 'tune_diffusion'):
+        xo.assert_allclose(getattr(res_sa, name), getattr(res, name),
+                           rtol=0, atol=0)
+
+    # Lost particle
+    assert not res.fma_valid[-1] and np.isnan(res.qx[-1])
+    assert np.all(res.fma_valid[:-1])
+
+    # NumPy oracle on the regular orbits
+    ref = hr.HenonReference(OMEGA_X, OMEGA_Y, COEFFS)
+    qx1, qy1, qx2, qy2, diff = hr.birkhoff_tunes(
+        ref.trajectory(z0[:, regular], 2 * window), 0, window)
+    for got, exp in ((res.qx, qx1), (res.qy, qy1), (res.qx2, qx2), (res.qy2, qy2)):
+        xo.assert_allclose(got[regular], exp, rtol=0, atol=1e-12)
+
+    # Small amplitude: linear tunes
+    xo.assert_allclose(res.qx[0], 0.168, rtol=0, atol=1e-6)
+    xo.assert_allclose(res.qy[0], 0.201, rtol=0, atol=1e-6)
+
+    # Diffusion separates regular from chaotic orbits
+    assert np.all(res.tune_diffusion[regular] < -6)
+    assert np.all(res.tune_diffusion[chaotic] > -4.5)
+
+    # Birkhoff vs NAFF (reference path) on regular orbits
+    res_naff = xt.chaos.compute_fma(line, _particles(ctx, z0), window,
+                                    method='naff')
+    assert res_naff.fma_method == 'naff'
+    assert not res_naff.fma_valid[-1]
+    for name in ('qx', 'qy', 'qx2', 'qy2'):
+        xo.assert_allclose(getattr(res_naff, name)[regular],
+                           getattr(res, name)[regular], rtol=0, atol=1e-5)
+    assert np.all(res_naff.tune_diffusion[chaotic] > -4.5)
+
+    # The monitor is passive in backtracking and the line stays backtrackable
+    qx_before = monitor.get_tunes()[0].copy()
+    p = _particles(ctx, z0[:, :3])
+    line_mon.track(p, num_turns=5, backtrack=True)
+    xo.assert_allclose(monitor.get_tunes()[0], qx_before, rtol=0, atol=0)
+
+    # A monitor that does not match the request is rejected
+    with pytest.raises(ValueError, match='window'):
+        xt.chaos.compute_fma(line_mon, _particles(ctx, z0), window + 1)
