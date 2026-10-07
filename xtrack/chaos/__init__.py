@@ -13,7 +13,9 @@ from .ghosts import GhostLayout, build_ghost_particles, metric_from_twiss
 from .tangent import GhostTangent
 from .tune_monitor import BirkhoffTuneMonitor
 from .indicators import (
+    ALL_INDICATORS,
     ChaosIndicators,
+    compute_indicators,
     birkhoff_weights,
     compute_fma,
     compute_rem,

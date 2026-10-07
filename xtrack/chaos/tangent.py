@@ -112,8 +112,8 @@ class GhostTangent(xo.HybridClass):
             super().__init__(**kwargs)
             return
 
-        if dim not in (2, 4):
-            raise ValueError('Only dim = 2 or 4 is supported')
+        if dim not in (2, 4, 6):
+            raise ValueError('`dim` must be 2, 4 or 6')
         if n_ghosts < 0 or n_ghosts > dim:
             raise ValueError('`n_ghosts` must be between 0 and `dim`')
 

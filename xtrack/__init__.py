@@ -42,6 +42,8 @@ from .multisetter import MultiSetter
 
 from .footprint import Footprint, LinearRescale
 from . import chaos
+# Lines containing the tune monitor can be loaded with Line.from_dict
+monitor_classes = monitor_classes + (chaos.BirkhoffTuneMonitor,)
 from .integral_optimization import IntegralOptimization
 
 # Flags and test functions

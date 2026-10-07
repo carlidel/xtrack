@@ -82,6 +82,16 @@ class ChaosIndicators:
     gali : dict k -> (S, N)
         Generalised alignment index of order ``k = 2..G``, the volume spanned
         by the first k unit deviation vectors.
+    rem_turns : (H,) int
+        Horizons of the reversibility error.
+    rem : (H, N)
+        Reversibility error ``|M^-n M^n z - z|`` in the metric; NaN if the
+        particle was lost. ``rem_valid`` (H, N) flags finite entries.
+    qx, qy, qx2, qy2 : (N,)
+        Tunes in the first and second FMA window (NaN if lost).
+    tune_diffusion : (N,)
+        ``log10(sqrt((qx - qx2)^2 + (qy - qy2)^2))``. ``fma_valid`` (N,)
+        flags complete measurements, ``fma_method`` says how they were made.
     """
 
     def __init__(self, particle_id, sample_turns):
@@ -144,7 +154,9 @@ def compute_tangent_indicators(line, particles, num_turns, sample_turns=None,
         Maps a phase-space displacement to the space where norms are taken
         (identity by default; see :func:`metric_from_twiss`).
     dim : int
-        Phase-space dimension: 4 for ``(x, px, y, py)``, 2 for ``(x, px)``.
+        Phase-space dimension: 4 for ``(x, px, y, py)``, 2 for ``(x, px)``,
+        6 for ``(x, px, y, py, zeta, pzeta)`` (energy variables of the
+        ghosts are updated consistently from ``pzeta``).
     alignment : bool
         Compute SALI and GALI (needs ``n_ghosts >= 2``).
 
@@ -258,7 +270,8 @@ def compute_rem(line, particles, rem_turns, metric=None, dim=4,
     metric : (dim, dim) array, optional
         Metric for the distance (identity by default).
     dim : int
-        4 for ``(x, px, y, py)``, 2 for ``(x, px)``.
+        4 for ``(x, px, y, py)``, 2 for ``(x, px)``, 6 for
+        ``(x, px, y, py, zeta, pzeta)``.
 
     Returns
     -------
@@ -355,6 +368,10 @@ def compute_fma(line, particles, window, start_turn=0, metric=None,
         single call; otherwise a standalone monitor is applied between
         one-turn tracking calls. ``'naff'``: turn-by-turn data and
         ``nafflib.tune`` on the host (reference path; needs ``nafflib``).
+        The Birkhoff tune is a rotation number around the origin: it
+        agrees with NAFF when the projected motion winds around the origin,
+        but not when a plane is dominated by other frequencies (see
+        :class:`BirkhoffTuneMonitor`).
 
     Returns
     -------
@@ -424,4 +441,126 @@ def compute_fma(line, particles, window, start_turn=0, metric=None,
     res.tune_diffusion = diffusion
     res.fma_valid = np.isfinite(qx1)
     res.fma_method = method
+    return res
+
+
+ALL_INDICATORS = ('fli', 'sali', 'gali', 'rem', 'fma')
+
+
+def compute_indicators(line, particles, num_turns, sample_turns=None,
+                       indicators=ALL_INDICATORS, n_ghosts=4,
+                       displacement=1e-8, renorm_every=1, metric=None,
+                       rem_turns=None, fma_window=None, fma_start_turn=0,
+                       closed_orbit=None, fma_method='birkhoff', dim=4):
+    """Compute several chaos indicators for the same reference particles.
+
+    Parameters
+    ----------
+    line : xtrack.Line
+        Line with a tracker; one pass is one turn.
+    particles : xtrack.Particles
+        Reference particles (all alive). They are not modified.
+    num_turns : int
+        Turns of the tangent (ghost) run.
+    sample_turns : sequence of int, optional
+        Turns at which the tangent indicators are returned (default
+        ``[num_turns]``); also the default REM horizons.
+    indicators : sequence of str
+        Any of ``'fli'`` (FLI, Lyapunov estimate and Birkhoff FLI),
+        ``'sali'``, ``'gali'``, ``'rem'``, ``'fma'``.
+    n_ghosts : int
+        Ghosts per reference for SALI/GALI (one ghost is used if only FLI
+        is requested).
+    displacement, renorm_every, metric, dim :
+        See :func:`compute_tangent_indicators`. The metric and `dim` are
+        also used by REM; FMA always works in ``(x, px, y, py)`` and takes
+        the upper-left 4x4 block of the metric.
+    rem_turns : sequence of int, optional
+        REM horizons (default `sample_turns`).
+    fma_window, fma_start_turn, closed_orbit, fma_method :
+        See :func:`compute_fma`. Default window
+        ``(num_turns - fma_start_turn - 1) // 2``.
+
+    Notes
+    -----
+    Passes over the line: one ghost pass for the tangent indicators; REM
+    needs its own forward + backward pass. FMA is measured within the ghost
+    pass when the line contains a matching :class:`BirkhoffTuneMonitor`
+    (``particle_id_start=0``, ``num_particles >= N``, same window and start
+    turn) and ``fma_method='birkhoff'``; otherwise it uses a separate pass.
+
+    Returns
+    -------
+    ChaosIndicators
+        All requested results, ordered by reference ``particle_id``.
+    """
+    indicators = tuple(indicators)
+    unknown = set(indicators) - set(ALL_INDICATORS)
+    if unknown:
+        raise ValueError(f'Unknown indicators: {sorted(unknown)}')
+    _check_line(line)
+    num_turns = int(num_turns)
+    sample_turns = _sample_turns_or_default(num_turns, sample_turns)
+    if 'rem' in indicators:
+        _check_backtrackable(line)  # fail before the long passes
+
+    p_sorted, layout = build_ghost_particles(particles, n_ghosts=0,
+                                             _context=line._context)
+    res = ChaosIndicators(layout.reference_particle_id, sample_turns)
+    res.indicators = indicators
+    del p_sorted
+
+    want_tangent = any(ii in indicators for ii in ('fli', 'sali', 'gali'))
+    want_alignment = 'sali' in indicators or 'gali' in indicators
+
+    fma_done = False
+    if 'fma' in indicators:
+        if fma_window is None:
+            fma_window = (num_turns - fma_start_turn - 1) // 2
+        if fma_window < 1:
+            raise ValueError('`num_turns` is too short for the FMA windows')
+
+    if want_tangent:
+        mon = None
+        if ('fma' in indicators and fma_method == 'birkhoff'
+                and fma_start_turn + 2 * fma_window + 1 <= num_turns):
+            mon = _get_inline_tune_monitor(line, layout.n_ref, fma_window,
+                                           fma_start_turn)
+            if mon is not None:
+                ctx = line._context
+                mm = np.eye(4) if metric is None else np.asarray(metric)[:4, :4]
+                co = np.zeros(4) if closed_orbit is None else np.asarray(closed_orbit)
+                mon.w_inv[:] = ctx.nparray_to_context_array(
+                    np.ascontiguousarray(mm, dtype=float).ravel())
+                mon.closed_orbit[:] = ctx.nparray_to_context_array(
+                    np.asarray(co, dtype=float))
+                mon.reset()
+        compute_tangent_indicators(
+            line, particles, num_turns, sample_turns,
+            n_ghosts=n_ghosts if want_alignment else 1,
+            displacement=displacement, renorm_every=renorm_every,
+            metric=metric, dim=dim, alignment=want_alignment, _result=res)
+        if mon is not None:
+            qx1, qy1, qx2, qy2, diff = (vv[:layout.n_ref]
+                                        for vv in mon.get_tunes())
+            res.qx, res.qy, res.qx2, res.qy2 = qx1, qy1, qx2, qy2
+            res.tune_diffusion = diff
+            res.fma_valid = np.isfinite(qx1)
+            res.fma_method = 'birkhoff (in-line, ghost pass)'
+            fma_done = True
+        if 'sali' not in indicators and hasattr(res, 'sali'):
+            del res.sali
+        if 'gali' not in indicators and hasattr(res, 'gali'):
+            del res.gali
+
+    if 'fma' in indicators and not fma_done:
+        compute_fma(line, particles, fma_window, start_turn=fma_start_turn,
+                    metric=None if metric is None else np.asarray(metric)[:4, :4],
+                    closed_orbit=closed_orbit,
+                    method=fma_method, _result=res)
+
+    if 'rem' in indicators:
+        compute_rem(line, particles,
+                    sample_turns if rem_turns is None else rem_turns,
+                    metric=metric, dim=dim, _result=res)
     return res

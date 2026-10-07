@@ -467,3 +467,161 @@ def test_fma_birkhoff_tune_monitor(test_context):
     # A monitor that does not match the request is rejected
     with pytest.raises(ValueError, match='window'):
         xt.chaos.compute_fma(line_mon, _particles(ctx, z0), window + 1)
+
+
+# Combined driver -----------------------------------------------------------
+
+@for_all_test_contexts
+@allow_kernel_compilation
+def test_compute_indicators(test_context):
+    r = np.array([0.05, 0.2, 0.36, 0.5])
+    z0 = _diagonal_orbits(r)
+    num_turns, sample_turns, window = 401, [100, 401], 200
+
+    monitor = xt.chaos.BirkhoffTuneMonitor(num_particles=len(r), window=window)
+    henon = xt.Henonmap(omega_x=OMEGA_X, omega_y=OMEGA_Y,
+                        multipole_coeffs=COEFFS, norm=True)
+    aperture = xt.LimitRect(min_x=-1, max_x=1, min_y=-1, max_y=1)
+    ctx, line_mon = context_and_line(test_context, [monitor, henon, aperture])
+    _, line = _henon_line(test_context)
+
+    for ll, fma_where in ((line_mon, 'birkhoff (in-line, ghost pass)'),
+                          (line, 'birkhoff')):
+        res = xt.chaos.compute_indicators(
+            ll, _particles(ctx, z0), num_turns, sample_turns,
+            fma_window=window)
+        assert res.fma_method == fma_where
+        tan = xt.chaos.compute_tangent_indicators(
+            line, _particles(ctx, z0), num_turns, sample_turns)
+        for name in ('valid', 'lost_at_turn', 'fli', 'lyapunov',
+                     'fli_birkhoff', 'sali'):
+            xo.assert_allclose(getattr(res, name), getattr(tan, name),
+                               rtol=0, atol=0)
+        for kk in (2, 3, 4):
+            xo.assert_allclose(res.gali[kk], tan.gali[kk], rtol=0, atol=0)
+        fma = xt.chaos.compute_fma(line, _particles(ctx, z0), window)
+        for name in ('qx', 'qy', 'qx2', 'qy2', 'tune_diffusion', 'fma_valid'):
+            xo.assert_allclose(getattr(res, name), getattr(fma, name),
+                               rtol=0, atol=0)
+        rem = xt.chaos.compute_rem(line, _particles(ctx, z0), sample_turns)
+        xo.assert_allclose(res.rem, rem.rem, rtol=0, atol=0)
+        assert np.all(res.rem_turns == sample_turns)
+
+    # FLI only: one ghost, no alignment indices, no REM/FMA
+    res = xt.chaos.compute_indicators(line, _particles(ctx, z0), 100,
+                                      indicators=('fli',))
+    assert res.log_growth.shape == (1, len(r), 1)
+    for name in ('sali', 'gali', 'rem', 'qx'):
+        assert not hasattr(res, name)
+
+    with pytest.raises(ValueError, match='Unknown'):
+        xt.chaos.compute_indicators(line, _particles(ctx, z0), 100,
+                                    indicators=('lyapunov_spectrum',))
+
+
+# 6D ghosts on a lattice ----------------------------------------------------
+
+def _fodo_ring_with_cavity():
+    cell = [xt.Drift(length=2.5),
+            xt.Multipole(knl=[0, 0.18]), xt.Multipole(knl=[0, 0, 0.5]),
+            xt.Drift(length=5.0),
+            xt.Multipole(knl=[0, -0.18]), xt.Multipole(knl=[0, 0, -0.8]),
+            xt.Drift(length=2.5)]
+    elements = []
+    for _ in range(8):
+        elements += [ee.copy() for ee in cell]
+    line = xt.Line(elements=elements)
+    line.particle_ref = xt.Particles(p0c=1e9, mass0=xt.PROTON_MASS_EV)
+    beta0 = line.particle_ref.beta0[0]
+    frev = beta0 * 299792458.0 / line.get_length()
+    line.append('cavity', xt.Cavity(voltage=3e5, frequency=4 * frev))
+    return line
+
+
+@for_all_test_contexts
+@allow_kernel_compilation
+def test_tangent_indicators_dim6_fodo_cavity(test_context):
+    line = _fodo_ring_with_cavity()
+    line.build_tracker(_context=test_context)
+    ctx = test_context
+    tw = line.twiss()  # 6D, with synchrotron motion
+    assert tw.qs > 1e-3
+    W = tw.W_matrix[0]
+    metric = xt.chaos.metric_from_twiss(tw, dim=6)
+    xo.assert_allclose(metric @ W, np.eye(6), rtol=0, atol=1e-9)
+    co = np.array([tw.x[0], tw.px[0], tw.y[0], tw.py[0], tw.zeta[0], tw.pzeta[0]])
+    names = ('x', 'px', 'y', 'py', 'zeta', 'pzeta')
+
+    def particles(zz):
+        kw = {nn: zz[kk] for kk, nn in enumerate(names)}
+        return xt.Particles(_context=ctx, p0c=1e9, mass0=xt.PROTON_MASS_EV, **kw)
+
+    # Initial conditions in normalised coordinates (all three planes)
+    a = np.array([2e-4, 8e-4, 1.5e-3])
+    zn0 = np.array([a, 0 * a, a, 0 * a, 3e-4 + 0 * a, 0 * a])
+    z0 = co[:, None] + W @ zn0
+    num_turns = 40
+
+    res = xt.chaos.compute_tangent_indicators(
+        line, particles(z0), num_turns, [10, num_turns], n_ghosts=6,
+        displacement=1e-9, metric=metric, dim=6)
+    assert np.all(res.valid)
+
+    # Oracle: one-turn Jacobians by central differences along the orbit,
+    # in normalised coordinates, deviation vectors renormalised every turn
+    h = 1e-8
+    zz = z0.copy()
+    V = np.tile(np.eye(6)[None], (len(a), 1, 1))
+    log_growth = np.zeros((len(a), 6))
+    out = {}
+    for turn in range(1, num_turns + 1):
+        disp = np.concatenate([+h * W, -h * W], axis=1)  # (6, 12)
+        zz_pm = (zz[:, :, None] + disp[:, None, :]).reshape(6, -1)
+        p = particles(np.concatenate([zz, zz_pm], axis=1))
+        line.track(p, num_turns=1)
+        p.sort(interleave_lost_particles=True)
+        coords = np.array([ctx.nparray_from_context_array(getattr(p, nn))
+                           for nn in names])
+        zz_new = coords[:, :len(a)]
+        dd = coords[:, len(a):].reshape(6, len(a), 12)
+        J = np.einsum('kl,lpj->pkj', metric, (dd[:, :, :6] - dd[:, :, 6:]) / (2 * h))
+        V = J @ V
+        r = np.linalg.norm(V, axis=1)
+        log_growth += np.log(r)
+        V /= r[:, None, :]
+        zz = zz_new
+        if turn in (10, num_turns):
+            out[turn] = log_growth.copy()
+    # Measured: 5e-7 (10 turns), 2e-6 (40 turns)
+    for ss, turn in enumerate((10, num_turns)):
+        xo.assert_allclose(res.log_growth[ss], out[turn], rtol=0, atol=1e-4)
+
+    # Ghosts carry consistent energy variables after a renormalisation
+    p_all, layout = xt.chaos.build_ghost_particles(
+        particles(z0), n_ghosts=6, displacement=1e-9, metric=metric, dim=6)
+    tangent = xt.chaos.GhostTangent(_context=ctx, n_ref=layout.n_ref,
+                                    n_ghosts=6, dim=6, eps=1e-9, metric=metric)
+    line.track(p_all, num_turns=3)
+    tangent.build_slot_map(p_all)
+    tangent.renormalise(p_all, ctx.zeros(1, dtype=np.float64), 0)
+    pz = ctx.nparray_from_context_array(p_all.pzeta)
+    check = xt.Particles(p0c=1e9, mass0=xt.PROTON_MASS_EV, pzeta=pz)
+    for nn in ('delta', 'rpp', 'rvv'):
+        xo.assert_allclose(ctx.nparray_from_context_array(getattr(p_all, nn)),
+                           getattr(check, nn), rtol=1e-15, atol=1e-18)
+
+
+def test_serialisation_of_new_elements():
+    monitor = xt.chaos.BirkhoffTuneMonitor(num_particles=3, window=10,
+                                           metric=2 * np.eye(4),
+                                           closed_orbit=[1e-3, 0, 0, 0])
+    henon = xt.Henonmap(omega_x=1.0, omega_y=2.0, multipole_coeffs=[2.0, -1.0],
+                        norm=True)
+    line = xt.Line(elements=[monitor, henon], element_names=['mon', 'henon'])
+    line2 = xt.Line.from_dict(line.to_dict())
+    assert isinstance(line2['mon'], xt.chaos.BirkhoffTuneMonitor)
+    assert line2['mon'].window == 10 and line2['mon'].num_particles == 3
+    xo.assert_allclose(line2['mon'].w_inv, 2 * np.eye(4).ravel(), rtol=0, atol=0)
+    xo.assert_allclose(line2['mon'].weights, monitor.weights, rtol=0, atol=0)
+    xo.assert_allclose(line2['henon'].fx_coeffs, henon.fx_coeffs, rtol=0, atol=0)
+    xo.assert_allclose(line2['henon'].omega_y, 2.0, rtol=0, atol=1e-15)

@@ -9,7 +9,7 @@ import xobjects as xo
 
 from ..particles import Particles
 
-COORD_NAMES = ('x', 'px', 'y', 'py')
+COORD_NAMES = ('x', 'px', 'y', 'py', 'zeta', 'pzeta')
 
 
 class GhostLayout:
@@ -71,10 +71,12 @@ def build_ghost_particles(particles, n_ghosts=4, displacement=1e-8,
     ``n_ghosts`` ghosts per reference (see :class:`GhostLayout`). Ghost ``g``
     is displaced from its reference by ``displacement * metric^-1 e_g``, so
     that in the metric the displacements are orthogonal with norm
-    `displacement`. The reference particles passed in are not modified.
+    `displacement`. Coordinates are ``(x, px)`` (dim 2), ``(x, px, y, py)``
+    (dim 4) or ``(x, px, y, py, zeta, pzeta)`` (dim 6, the order of the
+    twiss ``W_matrix``). The reference particles passed in are not modified.
     """
-    if dim not in (2, 4):
-        raise ValueError('Only dim = 2 or 4 is supported')
+    if dim not in (2, 4, 6):
+        raise ValueError('`dim` must be 2, 4 or 6')
     if not 0 <= n_ghosts <= dim:
         raise ValueError('`n_ghosts` must be between 0 and `dim`')
     if _context is None:
@@ -101,6 +103,10 @@ def build_ghost_particles(particles, n_ghosts=4, displacement=1e-8,
     for kk in range(dim):
         name = COORD_NAMES[kk]
         dct[name][n_ref:] += displacement * directions[kk, gg]
+    if dim == 6:
+        # delta, rpp and rvv are recomputed from pzeta
+        for kk in ('delta', 'rpp', 'rvv'):
+            dct.pop(kk, None)
 
     out = Particles.from_dict(dct, load_rng_state=False, _context=_context)
     layout = GhostLayout(n_ref=n_ref, n_ghosts=n_ghosts,

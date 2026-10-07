@@ -29,6 +29,14 @@ class BirkhoffTuneMonitor(BeamElement):
     measured in ``[0, 1)``; the advance per turn must stay below ``2 pi``
     (no aliasing correction). The element is passive in backtracking.
 
+    Limitation: the phase advance is a rotation number around the origin of
+    the normalised plane. It equals the NAFF tune when the projected motion
+    winds around the origin, which fails when the signal of a plane is
+    dominated by other frequencies or offsets (e.g. on the quadratic Henon
+    map for |x| << y^2, where the x motion is driven at 0 and 2 qy). Such
+    orbits get a wrong tune and a spurious large diffusion; use
+    ``compute_fma(..., method='naff')`` where this matters.
+
     Place it where the normalisation applies (usually at the start of the
     line, so that at turn ``t`` it sees the state after ``t`` turns) and
     track at least ``start_turn + 2 window + 1`` turns.
@@ -115,12 +123,12 @@ class BirkhoffTuneMonitor(BeamElement):
         kwargs.setdefault('qy2', np.zeros(num_particles))
         kwargs.setdefault('n_advances', np.zeros(num_particles, dtype=np.int64))
         kwargs.setdefault('weights', birkhoff_weights(window))
+        kwargs.setdefault('w_inv', metric.ravel())
+        kwargs.setdefault('closed_orbit', closed_orbit)
 
         super().__init__(start_turn=start_turn, window=window,
                          particle_id_start=particle_id_start,
-                         num_particles=num_particles,
-                         w_inv=metric.ravel(), closed_orbit=closed_orbit,
-                         **kwargs)
+                         num_particles=num_particles, **kwargs)
 
     def reset(self):
         """Clear the accumulators (to reuse the monitor for a new run)."""

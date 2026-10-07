@@ -35,7 +35,8 @@ double GhostTangent_get_coord(ParticlesData particles, int64_t slot, int64_t k)
 }
 
 
-// Only the transverse coordinates can be written (dim <= 4)
+// Write coordinate k; pzeta updates delta, rpp and rvv consistently (as
+// LocalParticle_update_pzeta)
 GPUFUN
 void GhostTangent_set_coord(ParticlesData particles, int64_t slot, int64_t k,
                             double value)
@@ -44,6 +45,16 @@ void GhostTangent_set_coord(ParticlesData particles, int64_t slot, int64_t k,
     else if (k == 1) ParticlesData_set_px(particles, slot, value);
     else if (k == 2) ParticlesData_set_y(particles, slot, value);
     else if (k == 3) ParticlesData_set_py(particles, slot, value);
+    else if (k == 4) ParticlesData_set_zeta(particles, slot, value);
+    else {
+        double const beta0 = ParticlesData_get_beta0(particles, slot);
+        double const ptau = value * beta0;
+        double const irpp = sqrt(ptau * ptau + 2.0 * value + 1.0);
+        ParticlesData_set_pzeta(particles, slot, value);
+        ParticlesData_set_delta(particles, slot, irpp - 1.0);
+        ParticlesData_set_rpp(particles, slot, 1.0 / irpp);
+        ParticlesData_set_rvv(particles, slot, irpp / (1.0 + beta0 * ptau));
+    }
 }
 
 
