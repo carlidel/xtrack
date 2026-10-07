@@ -343,3 +343,61 @@ def test_sali_gali_chaotic_orbit(test_context):
     assert ref['gali'][-1, 0, 2] < 1e-35
     late = res.gali[4][sample_turns >= 500, 0]
     assert np.median(late[late > 0]) > 1e-26
+
+
+# REM -----------------------------------------------------------------------
+
+@for_all_test_contexts
+@allow_kernel_compilation
+def test_rem(test_context):
+    r = np.array([0.05, 0.1, 0.2, 0.25, 0.34, 0.36, 0.38, 0.5])
+    regular = r <= 0.25
+    z0 = _diagonal_orbits(r)
+    rem_turns = [10, 1000, 3000]
+
+    res_all = []
+    for tc in (test_context, xo.ContextCpu()):
+        ctx, line = _henon_line(tc)
+        res_all.append(xt.chaos.compute_rem(line, _particles(ctx, z0), rem_turns))
+    res = res_all[0]
+    assert np.all(res.rem_turns == rem_turns)
+    assert np.all(res.particle_id == np.arange(len(r)))
+
+    # Lost orbit (r = 0.5): NaN
+    assert np.all(np.isnan(res.rem[:, -1])) and not np.any(res.rem_valid[:, -1])
+    assert np.all(res.rem_valid[:, :-1])
+
+    # Regular orbits: near round-off, slow growth
+    assert np.all(res.rem[0, regular] < 1e-15)
+    assert np.all(res.rem[1, regular] < 1e-12)
+    # Chaotic orbits: exponential growth, saturating at O(1)
+    chaotic = ~regular & (r < 0.5)
+    assert np.all(res.rem[1, chaotic] > 1e-6)
+    assert np.all(res.rem[2, chaotic] > 1e-1)
+
+    # Same orders of magnitude as the NumPy oracle on regular orbits
+    ref = hr.HenonReference(OMEGA_X, OMEGA_Y, COEFFS)
+    rem_ref = hr.reversibility_error(ref, z0[:, regular], 1000)
+    assert np.all(np.abs(np.log10(res.rem[1, regular] / rem_ref)) < 1.5)
+
+    # REM is round-off driven: compare contexts by classification
+    for res_ctx in res_all:
+        assert np.all((res_ctx.rem[1, :-1] < 1e-10) == regular[:-1])
+
+
+@for_all_test_contexts
+@allow_kernel_compilation
+def test_rem_requires_backtrackable_line(test_context):
+    line = xt.Line(elements=[
+        xt.Henonmap(omega_x=OMEGA_X, omega_y=OMEGA_Y, multipole_coeffs=COEFFS,
+                    norm=True),
+        xt.LineSegmentMap(qx=0.31, qy=0.32)])
+    line.build_tracker(_context=test_context, compile=False)
+    p = xt.Particles(x=[0.1], y=[0.1], _context=test_context)
+    with pytest.raises(ValueError, match='LineSegmentMap'):
+        xt.chaos.compute_rem(line, p, 10)
+
+    ctx, line_ok = _henon_line(test_context)
+    line_ok.enable_time_dependent_vars = True
+    with pytest.raises(ValueError, match='time-dependent'):
+        xt.chaos.compute_rem(line_ok, p, 10)

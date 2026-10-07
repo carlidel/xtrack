@@ -218,3 +218,88 @@ def compute_tangent_indicators(line, particles, num_turns, sample_turns=None,
         res.sali = sali
         res.gali = {kk: gali[:, :, kk - 2].copy() for kk in range(2, n_ghosts + 1)}
     return res
+
+
+def _check_backtrackable(line):
+    _check_line(line)
+    if line.enable_time_dependent_vars:
+        raise ValueError('REM is not supported with time-dependent variables '
+                         '(backtracking does not reverse them)')
+    if not line.tracker._tracker_data_base._is_backtrackable:
+        from ..line import _has_backtrack
+        elements = [line._element_dict[nn] for nn in line.element_names]
+        not_bt = sorted({type(ee).__name__ for ee in elements
+                         if not _has_backtrack(ee, line)})
+        raise ValueError('REM needs a backtrackable line; elements without '
+                         f'backtrack: {not_bt}')
+
+
+def compute_rem(line, particles, rem_turns, metric=None, dim=4,
+                _result=None):
+    """Reversibility error method (REM).
+
+    For every horizon ``n`` in `rem_turns` the particles are tracked ``n``
+    turns forward and then ``n`` turns backward (``backtrack=True``);
+    ``REM(n)`` is the metric distance between the final and the initial
+    coordinates. A single forward pass is used: at each horizon a copy of
+    the particles is backtracked. REM is driven by round-off, so values are
+    meaningful as orders of magnitude (regular orbits: near round-off,
+    growing polynomially; chaotic orbits: growing exponentially, up to the
+    size of the orbit).
+
+    Parameters
+    ----------
+    line : xtrack.Line
+        Backtrackable, non-collective line without time-dependent variables.
+    particles : xtrack.Particles
+        Reference particles (all alive). They are not modified.
+    rem_turns : int or sequence of int
+        Horizons ``n``.
+    metric : (dim, dim) array, optional
+        Metric for the distance (identity by default).
+    dim : int
+        4 for ``(x, px, y, py)``, 2 for ``(x, px)``.
+
+    Returns
+    -------
+    ChaosIndicators
+        With ``rem_turns`` (H,), ``rem`` (H, N) (NaN where the particle was
+        lost in either direction) and ``rem_valid`` (H, N).
+    """
+    _check_backtrackable(line)
+    context = line._context
+    rem_turns = np.unique(np.atleast_1d(np.asarray(rem_turns, dtype=np.int64)))
+    if rem_turns[0] < 1:
+        raise ValueError('`rem_turns` must be positive')
+
+    p_ref, layout = build_ghost_particles(particles, n_ghosts=0, metric=metric,
+                                          dim=dim, _context=context)
+    n_ref = layout.n_ref
+    tangent = GhostTangent(_context=context, n_ref=n_ref, n_ghosts=0, dim=dim,
+                           metric=metric)
+    to_host = context.nparray_from_context_array
+    from .ghosts import COORD_NAMES
+    pid = to_host(p_ref.particle_id)
+    coords0 = np.zeros((n_ref, dim))
+    for kk in range(dim):
+        coords0[pid, kk] = to_host(getattr(p_ref, COORD_NAMES[kk]))
+    coords0 = context.nparray_to_context_array(np.ascontiguousarray(coords0.ravel()))
+    out = context.zeros(n_ref, dtype=np.float64)
+
+    rem = np.full((len(rem_turns), n_ref), np.nan)
+    turn = 0
+    for hh, n_turns in enumerate(rem_turns):
+        line.track(p_ref, num_turns=int(n_turns - turn))
+        turn = int(n_turns)
+        p_back = p_ref.copy()
+        line.track(p_back, num_turns=int(n_turns), backtrack=True)
+        tangent.distance(p_back, coords0, out)
+        dd = to_host(out).copy()
+        rem[hh] = np.where(dd >= 0, dd, np.nan)
+        del p_back
+
+    res = _result or ChaosIndicators(layout.reference_particle_id, rem_turns)
+    res.rem_turns = rem_turns
+    res.rem = rem
+    res.rem_valid = np.isfinite(rem)
+    return res

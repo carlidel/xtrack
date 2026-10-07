@@ -14,6 +14,7 @@ from .tangent import GhostTangent
 from .indicators import (
     ChaosIndicators,
     birkhoff_weights,
+    compute_rem,
     compute_tangent_indicators,
     renormalisation_turns,
 )
