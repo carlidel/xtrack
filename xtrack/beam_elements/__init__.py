@@ -41,6 +41,7 @@ from .xy_shift import XYShift
 from .translation import Translation
 from .elens import Elens
 from .nonlinear_lens import NonLinearLens
+from .henonmap import Henonmap
 from .wire import Wire
 from .rotation import Rotation
 from .s_rotation import SRotation
